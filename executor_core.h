@@ -1,0 +1,73 @@
+/*
+ * executor_core.h — Native Roblox Luau Executor Core for macOS
+ */
+
+#ifndef EXECUTOR_CORE_H
+#define EXECUTOR_CORE_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef void lua_State;
+
+/* Initialize pattern scanning and hooks for Roblox game state */
+bool executor_init(void);
+
+/* Get captured game lua_State* */
+lua_State* executor_get_game_state(void);
+
+/* Elevate Luau ExtraSpace security identity and capabilities */
+void executor_set_identity(lua_State* L, int identity, uint64_t capabilities);
+
+/* Compile Lua source code to Luau bytecode string */
+char* executor_compile_luau(const char* source, size_t* out_len, char* err_buf, size_t err_buf_len);
+
+/* Execute Lua code inside live game lua_State* */
+int executor_execute(const char* code, char* response_buf, size_t response_buf_len);
+
+/* Check if game lua_State is ready and DataModel is active */
+bool executor_is_ready(void);
+
+/* Vtable hook lab: dump live vtable slots + writability test */
+int executor_vtable_lab(char* buf, size_t len);
+
+/* Install vtable trampoline hooks on slot range [first, last] */
+int executor_hook_vtable(int first, int last, char* buf, size_t len);
+
+/* Restore original vtable slots */
+int executor_unhook_vtable(char* buf, size_t len);
+
+/* Full-heap scan for the game lua_State (backref invariant) — zero game
+ * modification, cannot crash the client. */
+int executor_scan_heap(char* buf, size_t len);
+
+/* Read-only memory dump: 64 qwords at addr (kernel-mediated read) */
+int executor_dump(uintptr_t addr, char* buf, size_t len);
+
+/* Dump ScriptContext instances with heap-pointer annotation */
+int executor_sc_dump(char* buf, size_t len);
+
+/* Find code references (adrp+ldr/add) to an absolute address */
+int executor_xref(uintptr_t target, char* buf, size_t len);
+int executor_backref(uintptr_t target, char* buf, size_t len);
+
+/* ASLR slide of the RobloxPlayer image (link-time __TEXT is 0x100000000) */
+uintptr_t executor_image_slide(void);
+
+/* Execute Lua code inside the live game thread (ForgeChunks-style VM):
+ * decompress L, intern source string, push, loadstring, protected call. */
+int executor_exec_gamestate(const char* code, char* out, size_t out_len);
+
+/* Diagnostics: main-thread cache validity + live snapshot (__DIAG__). */
+int executor_diag(char* buf, size_t len);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* EXECUTOR_CORE_H */

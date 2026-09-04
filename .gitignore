@@ -1,0 +1,36 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Python cache & build
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Telegram session and crawler output (contains credentials / private data)
+*.session
+*.session-journal
+burner.session
+crawls/
+
+# Compiled binaries and objects
+*.o
+*.dylib
+*.so
+*.a
+
+# Logs
+*.log
+logs/
+ui/logs/
+
+# System and IDE files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>INJ Control Panel</title>
+<style>
+  :root {
+    --bg: #0d1117; --bg2: #161b22; --bg3: #1c2330; --border: #2d333f;
+    --fg: #e6edf3; --fg-dim: #8b949e; --accent: #58a6ff; --green: #3fb950;
+    --red: #f85149; --yellow: #d29922; --mono: "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--fg); font: 14px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; align-items: center; gap: 14px; padding: 14px 22px;
+           background: var(--bg2); border-bottom: 1px solid var(--border); }
+  header h1 { font-size: 17px; font-weight: 600; letter-spacing: .4px; }
+  header h1 span { color: var(--accent); }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--red);
+         display: inline-block; box-shadow: 0 0 6px currentColor; }
+  .dot.ok { background: var(--green); }
+  .hdr-status { color: var(--fg-dim); font-size: 12.5px; display: flex; align-items: center; gap: 7px; }
+  nav { display: flex; gap: 4px; padding: 0 22px; background: var(--bg2);
+        border-bottom: 1px solid var(--border); }
+  nav button { background: none; border: none; color: var(--fg-dim); padding: 10px 16px;
+               font-size: 13.5px; cursor: pointer; border-bottom: 2px solid transparent; }
+  nav button:hover { color: var(--fg); }
+  nav button.active { color: var(--accent); border-bottom-color: var(--accent); }
+  main { padding: 22px; max-width: 1150px; margin: 0 auto; }
+  .tab { display: none; }
+  .tab.active { display: block; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+  .card { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; }
+  .card h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px;
+             color: var(--fg-dim); margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+  .kv { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13.5px; }
+  .kv b { font-weight: 500; }
+  .kv .k { color: var(--fg-dim); }
+  .badge { padding: 2px 9px; border-radius: 20px; font-size: 11.5px; font-weight: 600; }
+  .badge.ok { background: rgba(63,185,80,.15); color: var(--green); }
+  .badge.err { background: rgba(248,81,73,.15); color: var(--red); }
+  .badge.warn { background: rgba(210,153,34,.15); color: var(--yellow); }
+
+  button.btn { background: var(--bg3); color: var(--fg); border: 1px solid var(--border);
+               border-radius: 7px; padding: 8px 15px; font-size: 13px; cursor: pointer; transition: .15s; }
+  button.btn:hover { border-color: var(--accent); }
+  button.btn:disabled { opacity: .45; cursor: default; }
+  button.btn.primary { background: var(--accent); border-color: var(--accent); color: #0b1521; font-weight: 600; }
+  button.btn.danger:hover { border-color: var(--red); color: var(--red); }
+  button.btn.small { padding: 4px 10px; font-size: 12px; }
+  input[type=text] { background: var(--bg3); border: 1px solid var(--border); color: var(--fg);
+                     border-radius: 7px; padding: 8px 11px; font-size: 13px; width: 100%; }
+  input[type=text]:focus { outline: none; border-color: var(--accent); }
+  .row { display: flex; gap: 10px; align-items: center; }
+  .row > * { flex: 0 0 auto; }
+  .row .grow { flex: 1 1 auto; }
+  .mt { margin-top: 14px; } .mb { margin-bottom: 14px; }
+  pre.out { background: #0a0e14; border: 1px solid var(--border); border-radius: 8px;
+            padding: 12px 14px; font-family: var(--mono); font-size: 12.5px; white-space: pre-wrap;
+            word-break: break-word; max-height: 340px; overflow-y: auto; }
+  .dim { color: var(--fg-dim); }
+
+  /* Executor */
+  .exec-wrap { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .exec-wrap { grid-template-columns: 1fr; } }
+  textarea#editor { width: 100%; min-height: 380px; background: #0a0e14; color: var(--fg);
+                    border: 1px solid var(--border); border-radius: 8px; padding: 13px 15px;
+                    font-family: var(--mono); font-size: 13px; line-height: 1.55; resize: vertical;
+                    tab-size: 2; }
+  textarea#editor:focus { outline: none; border-color: var(--accent); }
+  #console { min-height: 380px; max-height: 520px; overflow-y: auto; background: #0a0e14;
+             border: 1px solid var(--border); border-radius: 8px; padding: 10px 13px;
+             font-family: var(--mono); font-size: 12.5px; }
+  .con-entry { margin-bottom: 12px; }
+  .con-time { color: var(--fg-dim); font-size: 11px; }
+  .con-code { color: var(--accent); white-space: pre-wrap; word-break: break-word; opacity: .8; }
+  .con-resp { white-space: pre-wrap; word-break: break-word; color: var(--fg); }
+  .con-resp.err { color: var(--red); }
+  select { background: var(--bg3); color: var(--fg); border: 1px solid var(--border);
+           border-radius: 7px; padding: 7px 10px; font-size: 13px; }
+
+  .script-item { display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+                 background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; }
+  .script-item:hover { border-color: var(--accent); }
+  .script-item .name { font-family: var(--mono); font-size: 13px; flex: 1; }
+  .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--fg-dim);
+             border-top-color: transparent; border-radius: 50%; animation: spin .7s linear infinite;
+             vertical-align: -2px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .help h2 { font-size: 15px; margin: 18px 0 8px; color: var(--accent); }
+  .help p, .help li { color: var(--fg); font-size: 13.5px; }
+  .help ul { padding-left: 20px; }
+  .help code { background: var(--bg3); padding: 2px 6px; border-radius: 5px;
+               font-family: var(--mono); font-size: 12.5px; }
+  .help pre { background: #0a0e14; border: 1px solid var(--border); border-radius: 8px;
+              padding: 12px 14px; font-family: var(--mono); font-size: 12.5px; margin: 8px 0; overflow-x: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>INJ <span>Control Panel</span></h1>
+  <div class="hdr-status"><span class="dot" id="dot"></span><span id="hdrText">подключение…</span></div>
+  <div style="flex:1"></div>
+  <label class="hdr-status"><input type="checkbox" id="autorefresh" checked> автообновление</label>
+</header>
+<nav>
+  <button data-tab="dashboard" class="active">Панель</button>
+  <button data-tab="executor">Исполнитель</button>
+  <button data-tab="scripts">Скрипты</button>
+  <button data-tab="logs">Логи</button>
+  <button data-tab="help">Справка</button>
+</nav>
+<main>
+
+<!-- ============ DASHBOARD ============ -->
+<section id="tab-dashboard" class="tab active">
+  <div class="grid">
+    <div class="card">
+      <h3>payload.dylib <span id="dylibBadge"></span></h3>
+      <div class="kv"><span class="k">Собран</span><b id="dylibExists">—</b></div>
+      <div class="kv"><span class="k">Архитектуры</span><b id="dylibArchs">—</b></div>
+      <div class="kv"><span class="k">Размер</span><b id="dylibSize">—</b></div>
+      <div class="kv"><span class="k">Изменён</span><b id="dylibMtime">—</b></div>
+      <div class="mt row">
+        <button class="btn primary" id="btnBuild">Собрать</button>
+        <span id="buildSpin"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Целевой процесс <span id="procBadge"></span></h3>
+      <div id="procList" class="mb dim">—</div>
+      <div class="row">
+        <input type="text" id="procName" value="RobloxPlayer" class="grow" placeholder="Имя процесса">
+        <button class="btn primary" id="btnInject">Инъецировать (lldb)</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>IPC-сокет <span id="sockBadge"></span></h3>
+      <div class="kv"><span class="k">Путь</span><b id="sockPath" style="font-family:var(--mono);font-size:12px">—</b></div>
+      <div class="kv"><span class="k">Ping</span><b id="sockPing">—</b></div>
+      <div class="mt row">
+        <button class="btn" id="btnPing">Проверить</button>
+        <button class="btn danger" id="btnReset">Сброс Lua-состояния</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Запуск с инъекцией</h3>
+      <div class="kv mb"><span class="k">Цель по умолчанию</span><b id="targetExists">—</b></div>
+      <div class="row">
+        <input type="text" id="targetPath" class="grow" style="font-family:var(--mono);font-size:12px" placeholder="/Applications/Roblox.app/Contents/MacOS/RobloxPlayer">
+        <button class="btn" id="btnLaunch">Запустить</button>
+      </div>
+      <p class="dim mt" style="font-size:12px">DYLD_INSERT_LIBRARIES работает только для неподписанных/ad-hoc-подписанных бинарей (или при частично отключённом SIP). Для подписанного Roblox используйте lldb-инъекцию.</p>
+    </div>
+  </div>
+  <div class="card mt">
+    <h3>Вывод операции</h3>
+    <pre class="out" id="opOut">—</pre>
+  </div>
+</section>
+
+<!-- ============ EXECUTOR ============ -->
+<section id="tab-executor" class="tab">
+  <div class="row mb">
+    <select id="scriptSelect"><option value="">— загрузить скрипт —</option></select>
+    <button class="btn small" id="btnSaveScript">Сохранить</button>
+    <button class="btn small danger" id="btnDeleteScript">Удалить</button>
+    <div style="flex:1"></div>
+    <button class="btn primary" id="btnRun">Выполнить ⌘⏎</button>
+  </div>
+  <div class="exec-wrap">
+    <div><textarea id="editor" spellcheck="false" placeholder='-- Lua-код для выполнения в целевом процессе
+print("Привет из payload!")
+return 2 + 2'></textarea></div>
+    <div><div id="console"><span class="dim">Консоль вывода пуста. Отправьте код — ответ появится здесь.</span></div></div>
+  </div>
+</section>
+
+<!-- ============ SCRIPTS ============ -->
+<section id="tab-scripts" class="tab">
+  <div class="card">
+    <h3>Библиотека скриптов (scripts/)</h3>
+    <div id="scriptList" class="dim">Загрузка…</div>
+  </div>
+</section>
+
+<!-- ============ LOGS ============ -->
+<section id="tab-logs" class="tab">
+  <div class="card">
+    <h3>Лог payload'а <span class="dim" id="logPath" style="text-transform:none"></span></h3>
+    <div class="row mb">
+      <button class="btn small" id="btnRefreshLogs">Обновить</button>
+    </div>
+    <pre class="out" id="logOut" style="max-height:520px">—</pre>
+  </div>
+</section>
+
+<!-- ============ HELP ============ -->
+<section id="tab-help" class="tab help">
+  <div class="card">
+    <h3>Как пользоваться</h3>
+    <h2>Быстрый старт</h2>
+    <ul>
+      <li>1. Нажмите <b>Собрать</b> — будет скомпилирован <code>payload.dylib</code> (universal: arm64 + x86_64).</li>
+      <li>2. Запустите Roblox (или другой целевой процесс) обычным способом.</li>
+      <li>3. Нажмите <b>Инъецировать (lldb)</b> — payload загрузится в процесс и поднимет IPC-сокет.</li>
+      <li>4. Перейдите во вкладку <b>Исполнитель</b>, напишите Lua-код и нажмите <b>Выполнить</b> (⌘+Enter).</li>
+    </ul>
+    <h2>Протокол IPC</h2>
+    <p>Payload слушает Unix-сокет <code>/tmp/inj_ipc_&lt;uid&gt;.sock</code>. Одно соединение = один скрипт. Ответ содержит перехваченный вывод <code>print()</code> и возвращаемые значения (<code>=&gt; …</code>). Служебные команды: <code>__PING__</code>, <code>__RESET__</code>.</p>
+    <h2>CLI (альтернатива UI)</h2>
+    <pre>make            # сборка payload.dylib
+make test       # smoke-тест (поднимает payload в тестовом процессе)
+./live_inject.sh RobloxPlayer   # инъекция в запущенный процесс
+./send_lua.sh 'print(1+1)'     # отправка кода через сокет
+./send_lua.sh script.lua
+echo 'print(1)' | ./send_lua.sh</pre>
+    <h2>Ограничения macOS</h2>
+    <ul>
+      <li><code>DYLD_INSERT_LIBRARIES</code> игнорируется для бинарей с hardened runtime / platform-подписью. Используйте lldb-инъекцию.</li>
+      <li>lldb-инъекция требует, чтобы отладка была разрешена (Developer Tools), и может блокироваться анти-отладкой целевого процесса.</li>
+      <li>Библиотека Lua подгружается из Homebrew (<code>/opt/homebrew/lib/liblua.dylib</code>); поддерживаются Lua 5.1–5.4/Luau ABI.</li>
+    </ul>
+    <h2>Безопасность</h2>
+    <ul>
+      <li>Сокет доступен только владельцу (права 0600). UI слушает только 127.0.0.1.</li>
+      <li>Используйте инструмент только на собственных системах и в образовательных целях.</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const api = {
+  async get(p) { const r = await fetch(p); return r.json(); },
+  async post(p, body) {
+    const r = await fetch(p, {method:'POST', headers:{'Content-Type':'application/json'},
+                              body: JSON.stringify(body||{})});
+    return r.json();
+  }
+};
+
+/* ---------- tabs ---------- */
+document.querySelectorAll('nav button').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('nav button').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+  b.classList.add('active');
+  $('tab-' + b.dataset.tab).classList.add('active');
+  if (b.dataset.tab === 'scripts') loadScripts();
+  if (b.dataset.tab === 'logs') loadLogs();
+}));
+
+/* ---------- status ---------- */
+function fmtTime(ts) { return new Date(ts*1000).toLocaleString('ru-RU'); }
+function fmtSize(b) { return b > 1048576 ? (b/1048576).toFixed(1)+' МБ' : (b/1024).toFixed(1)+' КБ'; }
+function badge(el, ok, tOk, tErr) {
+  el.innerHTML = ok ? `<span class="badge ok">${tOk}</span>` : `<span class="badge err">${tErr}</span>`;
+}
+
+async function refreshStatus() {
+  let s;
+  try { s = await api.get('/api/status'); }
+  catch { $('dot').className='dot'; $('hdrText').textContent='сервер недоступен'; return; }
+
+  const online = !!(s.socket.exists && s.socket.ping);
+  $('dot').className = 'dot' + (online ? ' ok' : '');
+  $('hdrText').textContent = online ? s.socket.ping : (s.socket.exists ? 'сокет есть, нет ответа' : 'payload не активен');
+
+  badge($('dylibBadge'), s.dylib.exists, 'OK', 'нет');
+  $('dylibExists').textContent = s.dylib.exists ? 'да' : 'нет';
+  $('dylibArchs').textContent = s.dylib.exists ? s.dylib.archs : '—';
+  $('dylibSize').textContent = s.dylib.exists ? fmtSize(s.dylib.size) : '—';
+  $('dylibMtime').textContent = s.dylib.exists ? fmtTime(s.dylib.mtime) : '—';
+
+  const procs = s.processes;
+  badge($('procBadge'), procs.length > 0, procs.length + ' шт.', 'не найден');
+  $('procList').innerHTML = procs.length
+    ? procs.map(p => `<div class="kv"><span class="k">PID ${p.pid}</span><b>${p.name}</b></div>`).join('')
+    : '<span class="dim">Целевой процесс не запущен</span>';
+
+  badge($('sockBadge'), online, 'онлайн', 'офлайн');
+  $('sockPath').textContent = s.socket.path;
+  $('sockPing').textContent = s.socket.ping || 'нет ответа';
+
+  badge($('targetExists'), s.target_exists, 'найден', 'не найден');
+  if (!$('targetPath').value) $('targetPath').value = s.default_target;
+}
+setInterval(() => { if ($('autorefresh').checked) refreshStatus(); }, 3000);
+
+/* ---------- actions ---------- */
+function showOp(text) { $('opOut').textContent = text || '—'; }
+
+$('btnBuild').onclick = async () => {
+  $('btnBuild').disabled = true; $('buildSpin').innerHTML = '<span class="spinner"></span>';
+  showOp('Сборка…');
+  const r = await api.post('/api/build');
+  showOp(r.output);
+  $('btnBuild').disabled = false; $('buildSpin').innerHTML = '';
+  refreshStatus();
+};
+
+$('btnInject').onclick = async () => {
+  const proc = $('procName').value.trim() || 'RobloxPlayer';
+  $('btnInject').disabled = true; showOp(`Инъекция в процесс "${proc}" через lldb (может занять до минуты)…`);
+  const r = await api.post('/api/inject', {process: proc});
+  showOp(r.output);
+  $('btnInject').disabled = false; refreshStatus();
+};
+
+$('btnLaunch').onclick = async () => {
+  const target = $('targetPath').value.trim();
+  $('btnLaunch').disabled = true; showOp('Запуск цели с DYLD_INSERT_LIBRARIES…');
+  const r = await api.post('/api/launch', {target});
+  showOp(r.output);
+  $('btnLaunch').disabled = false;
+  setTimeout(refreshStatus, 2000);
+};
+
+$('btnPing').onclick = async () => {
+  const r = await api.post('/api/control', {command: '__PING__'});
+  showOp(r.ok ? r.response : ('Ошибка: ' + (r.error || r.response)));
+  refreshStatus();
+};
+
+$('btnReset').onclick = async () => {
+  const r = await api.post('/api/control', {command: '__RESET__'});
+  showOp(r.ok ? r.response : ('Ошибка: ' + (r.error || r.response)));
+};
+
+/* ---------- executor ---------- */
+function conLog(code, resp, isErr) {
+  const c = $('console');
+  if (c.querySelector('.dim')) c.innerHTML = '';
+  const e = document.createElement('div');
+  e.className = 'con-entry';
+  const t = document.createElement('div'); t.className = 'con-time';
+  t.textContent = new Date().toLocaleTimeString('ru-RU');
+  const cd = document.createElement('div'); cd.className = 'con-code';
+  cd.textContent = '❯ ' + (code.length > 300 ? code.slice(0,300) + '…' : code);
+  const rs = document.createElement('div'); rs.className = 'con-resp' + (isErr ? ' err' : '');
+  rs.textContent = resp;
+  e.append(t, cd, rs);
+  c.appendChild(e);
+  c.scrollTop = c.scrollHeight;
+}
+
+async function runCode() {
+  const code = $('editor').value;
+  if (!code.trim()) return;
+  $('btnRun').disabled = true;
+  const r = await api.post('/api/execute', {code});
+  $('btnRun').disabled = false;
+  if (r.error) conLog(code, '⚠ ' + r.error, true);
+  else conLog(code, r.response, !r.ok);
+}
+$('btnRun').onclick = runCode;
+$('editor').addEventListener('keydown', e => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); runCode(); }
+  if (e.key === 'Tab') { e.preventDefault();
+    const t = e.target, s = t.selectionStart;
+    t.value = t.value.slice(0, s) + '  ' + t.value.slice(t.selectionEnd);
+    t.selectionStart = t.selectionEnd = s + 2;
+  }
+});
+
+/* ---------- scripts ---------- */
+let scriptsCache = [];
+async function loadScripts() {
+  const r = await api.get('/api/scripts');
+  scriptsCache = r.scripts || [];
+  const sel = $('scriptSelect');
+  sel.innerHTML = '<option value="">— загрузить скрипт —</option>' +
+    scriptsCache.map(s => `<option value="${s.name}">${s.name}</option>`).join('');
+  const list = $('scriptList');
+  list.innerHTML = scriptsCache.length ? '' : '<span class="dim">Нет сохранённых скриптов</span>';
+  scriptsCache.forEach(s => {
+    const div = document.createElement('div');
+    div.className = 'script-item';
+    div.innerHTML = `<span class="name">${s.name}</span><span class="dim">${fmtSize(s.size)}</span>`;
+    const bLoad = document.createElement('button'); bLoad.className = 'btn small'; bLoad.textContent = 'Открыть';
+    bLoad.onclick = () => { $('editor').value = s.content; switchToExecutor(); };
+    const bDel = document.createElement('button'); bDel.className = 'btn small danger'; bDel.textContent = 'Удалить';
+    bDel.onclick = async () => { if (confirm('Удалить ' + s.name + '?')) { await api.post('/api/scripts/delete', {name: s.name}); loadScripts(); } };
+    div.append(bLoad, bDel);
+    list.appendChild(div);
+  });
+}
+function switchToExecutor() {
+  document.querySelectorAll('nav button').forEach(x => x.classList.toggle('active', x.dataset.tab === 'executor'));
+  document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x.id === 'tab-executor'));
+}
+$('scriptSelect').onchange = e => {
+  const s = scriptsCache.find(x => x.name === e.target.value);
+  if (s) $('editor').value = s.content;
+};
+$('btnSaveScript').onclick = async () => {
+  const name = prompt('Имя файла скрипта:', 'my_script.lua');
+  if (!name) return;
+  const r = await api.post('/api/scripts/save', {name, content: $('editor').value});
+  if (!r.ok) alert(r.error || 'Ошибка сохранения');
+  loadScripts();
+};
+$('btnDeleteScript').onclick = async () => {
+  const name = $('scriptSelect').value;
+  if (!name) { alert('Выберите скрипт в списке'); return; }
+  if (confirm('Удалить ' + name + '?')) { await api.post('/api/scripts/delete', {name}); loadScripts(); }
+};
+
+/* ---------- logs ---------- */
+async function loadLogs() {
+  const r = await api.get('/api/logs?lines=400');
+  $('logPath').textContent = r.path;
+  $('logOut').textContent = r.content || '(лог пуст — payload ещё не загружался)';
+}
+$('btnRefreshLogs').onclick = loadLogs;
+
+/* ---------- init ---------- */
+refreshStatus();
+loadScripts();
+</script>
+</body>
+</html>
