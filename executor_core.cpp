@@ -7,7 +7,10 @@
 
 #include "executor_core.h"
 #include "luau_signatures.h"
+#include "luau_resolver.h"
 #include <stdio.h>
+#include <ctype.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
@@ -57,6 +60,9 @@ static void exec_segv_handler(int sig, siginfo_t* si, void* ctx) {
     uintptr_t pc = 0, lr = 0;
     uintptr_t x8 = 0, x25 = 0, x26 = 0, x27 = 0, x20 = 0;
     if (ctx) {
+#if defined(__aarch64__)
+        /* the executor only ever runs against Apple Silicon Roblox; the
+         * x86_64 slice exists so the universal build links */
         ucontext_t* uc = (ucontext_t*)ctx;
         pc = uc->uc_mcontext->__ss.__pc;
         lr = uc->uc_mcontext->__ss.__lr;
@@ -65,6 +71,9 @@ static void exec_segv_handler(int sig, siginfo_t* si, void* ctx) {
         x25 = uc->uc_mcontext->__ss.__x[25];
         x26 = uc->uc_mcontext->__ss.__x[26];
         x27 = uc->uc_mcontext->__ss.__x[27];
+#else
+        (void)ctx;
+#endif
     }
     LOG_CORE("EXEC: %s at %p pc=%p lr=%p", sig == SIGBUS ? "SIGBUS" : "SIGSEGV",
              si->si_addr, (void*)pc, (void*)lr);
@@ -315,53 +324,101 @@ static uintptr_t find_ptr_in_sections(const section_range* secs, int nsecs,
  * Gold-standard invariant: a main lua_State holds a pointer to its
  * global_State, and global_State holds a pointer (mainthread) BACK to L.
  * We discover both offsets empirically — version-agnostic, no hardcoding. */
+/* Validate a global_State pointer by locating its string table
+ * {hash*, size, nuse} with TString-shaped entries. Offset-agnostic. */
+static int g_strt_ok(uintptr_t g) {
+    static uintptr_t ok_cache[64];
+    static uint8_t   ok_val[64];
+    static int ok_n = 0;
+    for (int k = 0; k < ok_n; k++)
+        if (ok_cache[k] == g) return ok_val[k];
+    int ok = 0;
+    uint8_t gb[0x440];
+    if (safe_read(g, gb, sizeof(gb))) {
+        for (int off = 0; off + 16 <= 0x440 && !ok; off += 8) {
+            uintptr_t bucket = *(uintptr_t*)(gb + off) & PTR_MASK;
+            if (bucket < 0x100000000ULL || bucket > 0x16000000000ULL || (bucket & 7))
+                continue;
+            uint64_t size = *(uint32_t*)(gb + off + 8);
+            uint64_t nuse = *(uint32_t*)(gb + off + 12);
+            if (size < 16 || size > 0x100000ULL || nuse > size * 2) continue;
+            uint64_t bs[16];
+            memset(bs, 0, sizeof(bs));
+            if (!safe_read(bucket, bs, sizeof(bs))) continue;
+            int good = 0, bad = 0;
+            for (int k = 0; k < 16; k++) {
+                if (bs[k] == 0) continue;
+                uintptr_t s = bs[k] & PTR_MASK;
+                if (s < 0x100000000ULL || s > 0x16000000000ULL || (s & 7)) { bad = 1; break; }
+                uint8_t sb[0x18];
+                if (!safe_read(s, sb, sizeof(sb))) { bad = 1; break; }
+                uint32_t slen = *(uint32_t*)(sb + 0x14);
+                if (slen == 0 || slen > 0x100000) { bad = 1; break; }
+                good++;
+            }
+            if (!bad && good >= 2) ok = 1;
+        }
+    }
+    if (ok_n < 64) { ok_cache[ok_n] = g; ok_val[ok_n] = (uint8_t)ok; ok_n++; }
+    return ok;
+}
+
+/* ---- 0.741 lua_State layout ---------------------------------------- */
+/* Derived from disasm of luaE_newthread (0x1026f3494), stack_init
+ * (0x1026f3570), lua_newthread (0x1026d6f1c), tothread (0x1026d8544),
+ * index2adr (0x1026dc1d4), lua_resume (0x1026e5a54) on 0.741.0.7411056.
+ * The API-visible lua_State is the 0x88-byte GC wrapper: tt byte at +1
+ * (LUA_TTHREAD = 0xA), status at +3, base@+0x60, G@+0x68, top@+0x70,
+ * value stack@+0x78, stack_last@+0x80. Every thread carries an
+ * anti-forgery magic at +0x18: u32 = low32(field address) ^ 0x2d. */
+#define LUA_TT_OFF      0x01
+#define LUA_STATUS_OFF  0x03
+#define LUA_MAGIC_OFF   0x18   /* u32: low32(L + 0x18) ^ 0x2d          */
+#define LUA_NUM8_OFF    0x1c   /* u32 == 8 right after init           */
+#define LUA_G_OFF       0x68
+#define LUA_BASE_OFF    0x60
+#define LUA_TOP_OFF     0x70
+#define LUA_STACK_OFF   0x78
+#define LUA_SLAST_OFF   0x80
+#define LUA_INNER_OFF   0x50   /* fresh: [+0x50] == [+0x58]            */
+
+static bool lua_thread_magic_ok(uintptr_t L) {
+    uint32_t m = 0;
+    if (!safe_read(L + LUA_MAGIC_OFF, &m, 4)) return false;
+    return m == ((uint32_t)((L + LUA_MAGIC_OFF) & 0xffffffffULL) ^ 0x2du);
+}
+
 static bool looks_like_lua_state_safe(uintptr_t candidate) {
     if (candidate == 0 || (candidate % 8) != 0) return false;
     if (candidate < 0x100000000ULL || candidate > 0x16000000000ULL) return false;
 
-    uint8_t buf[0x50];
+    uint8_t buf[0x88];
     if (!safe_read(candidate, buf, sizeof(buf))) return false;
 
-    uint8_t tt = buf[8];
-    if (tt != 9) return false; /* LUA_TTHREAD (Luau: 9; stock 5.x: 8) */
+    /* 0.741: tt byte at +1, G at +0x68, anti-forgery magic at +0x18. */
+    if (buf[LUA_TT_OFF] != 0xA) return false;
 
     uintptr_t cand_masked = candidate & PTR_MASK;
+    uintptr_t g = *(uintptr_t*)(buf + LUA_G_OFF) & PTR_MASK;
+    if (g < 0x100000000ULL || g > 0x16000000000ULL || (g & 0xF) != 0) return false;
+    uintptr_t dist = (g > cand_masked) ? (g - cand_masked) : (cand_masked - g);
+    if (dist < 0x60) return false;
+    if (!lua_thread_magic_ok(candidate)) return false;
+    if (!g_strt_ok(g)) return false;
 
-    /* try each 8-aligned field in [0x10,0x48] as a potential global_State*.
-     * global_State is part of the same LG allocation in Luau but lives
-     * AFTER lua_State, so it must be >= 0x60 bytes away. */
-    for (uintptr_t goff = 0x10; goff <= 0x48; goff += 8) {
-        uintptr_t g = *(uintptr_t*)(buf + goff) & PTR_MASK;
-        if (g < 0x100000000ULL || g > 0x16000000000ULL) continue;
-        if (g == cand_masked) continue;
-        uintptr_t dist = (g > cand_masked) ? (g - cand_masked) : (cand_masked - g);
-        if (dist < 0x60) continue;
-        uint8_t gbuf[0x300];
-        if (!safe_read(g, gbuf, sizeof(gbuf))) continue;
-        /* global_State[0] = frealloc: must be a CODE pointer inside the
-         * Roblox __TEXT segment (game's allocator function). */
-        uintptr_t frealloc = *(uintptr_t*)(gbuf + 0) & PTR_MASK;
-        if (g_text_base) {
-            if (frealloc < g_text_base || frealloc >= g_text_end) continue;
-        }
-        /* global_State[8] = ud: heap-ish pointer (may be NULL) */
-        uintptr_t gud = *(uintptr_t*)(gbuf + 8) & PTR_MASK;
-        if (gud != 0 && (gud < 0x100000000ULL || gud > 0x16000000000ULL)) continue;
-        /* mainthread sits past frealloc/ud/totalbytes — search [0x10, 0x300) */
-        for (uintptr_t boff = 0x10; boff + 8 <= sizeof(gbuf); boff += 8) {
-            uintptr_t back = *(uintptr_t*)(gbuf + boff) & PTR_MASK;
-            if (back != cand_masked) continue;
-            /* candidate must be a real thread: tt==8 at [8], global ptr field
-             * of the same shape — re-validate with the SAME goff */
-            uint8_t b2[0x50];
-            if (!safe_read(cand_masked, b2, sizeof(b2))) continue;
-            if (b2[8] != 8) continue;
-            uintptr_t g2 = *(uintptr_t*)(b2 + goff) & PTR_MASK;
-            if (g2 != g) continue;
-            LOG_CORE("CONFIRMED lua_State @ %p: global@+0x%lx -> %p, mainthread@+0x%lx",
-                     (void*)candidate, (unsigned long)goff, (void*)g, (unsigned long)boff);
-            return true;
-        }
+    /* the main thread is referenced back from global_State */
+    uint8_t gbuf[0x440];
+    if (!safe_read(g, gbuf, sizeof(gbuf))) return false;
+    for (int boff = 0; boff + 8 <= (int)sizeof(gbuf); boff += 8) {
+        uintptr_t back = *(uintptr_t*)(gbuf + boff) & PTR_MASK;
+        if (back != cand_masked) continue;
+        uint8_t b2[0x88];
+        if (!safe_read(cand_masked, b2, sizeof(b2))) continue;
+        if (b2[LUA_TT_OFF] != 0xA) continue;
+        if ((*(uintptr_t*)(b2 + LUA_G_OFF) & PTR_MASK) != g) continue;
+        LOG_CORE("CONFIRMED lua_State @ %p: G=%p strt-ok, mainthread@+0x%x",
+                 (void*)candidate, (void*)g, boff);
+        return true;
     }
     return false;
 }
@@ -439,11 +496,15 @@ static int collect_lua_candidates(uintptr_t region_addr, mach_vm_size_t region_s
          *   [9]  < 16 (marked)
          *   qword[1] >> 32 == 0xfffffffc  (GC epoch/fflags constant seen on
          *   all real threads) — kills chunk headers and ObjC objects. */
-        for (mach_vm_size_t i = 0; i + 0x50 <= got && n < max_out; i += 8) {
-            if (buf[i + 8] != 9) continue;
-            if (buf[i + 9] >= 16) continue;
-            uint64_t w1 = *(uint64_t*)(buf + i + 8);
-            if ((w1 >> 32) != 0xfffffffcULL) continue;
+        for (mach_vm_size_t i = 0; i + 0x88 <= got && n < max_out; i += 8) {
+            if (buf[i + LUA_TT_OFF] != 0xA) continue;   /* tt @ +1 (0.741) */
+            if (buf[i + 2] >= 16) continue;             /* marked */
+            uint32_t magic = *(uint32_t*)(buf + i + LUA_MAGIC_OFF);
+            uintptr_t cand = region_addr + off + i;
+            if (magic != ((uint32_t)((cand + LUA_MAGIC_OFF) & 0xffffffffULL) ^ 0x2du))
+                continue;                                /* anti-forgery */
+            uintptr_t gg = *(uintptr_t*)(buf + i + LUA_G_OFF) & PTR_MASK;
+            if (gg < 0x100000000ULL || gg > 0x16000000000ULL || (gg & 0xF)) continue;
             uintptr_t candidate = region_addr + off + i;
             out[n].addr = candidate;
             out[n].nptrs = 0;
@@ -836,10 +897,13 @@ static void* hunter_thread(void* arg) {
                  (void*)(sc_vptr & PTR_MASK),
                  (sc_vptr & PTR_MASK) == vtable_data ? "(REAL)" : "");
 
-        uint8_t chunk[0x808];
+        uint8_t chunk[0x2008];   /* 0.739: L may sit beyond 0x800 in SC */
         if (!safe_read(sc, chunk, sizeof(chunk))) {
-            LOG_CORE("instance %d: unreadable, skipping", i);
-            continue;
+            /* 0x2000 may cross into an unmapped page — fall back to 0x808 */
+            if (!safe_read(sc, chunk, 0x808)) {
+                LOG_CORE("instance %d: unreadable, skipping", i);
+                continue;
+            }
         }
         bool verified = false;
         for (uintptr_t off = 0; off + 8 <= sizeof(chunk); off += 8) {
@@ -847,16 +911,16 @@ static void* hunter_thread(void* arg) {
             if (v < 0x100000000ULL || v > 0x16000000000ULL) continue;
             /* log every in-range pointer candidate with its g/stack/top fields */
             {
-                uint8_t q[0x60];
+                uint8_t q[0x88];
                 if (safe_read(v, q, sizeof(q))) {
-                    uintptr_t vg = *(uintptr_t*)(q + 0x30);
-                    uintptr_t vstk = *(uintptr_t*)(q + 0x38);
-                    uintptr_t vtop = *(uintptr_t*)(q + 0x58);
+                    uintptr_t vg = *(uintptr_t*)(q + LUA_G_OFF);    /* 0.741: L->G */
+                    uintptr_t vstk = *(uintptr_t*)(q + LUA_STACK_OFF);
+                    uintptr_t vtop = *(uintptr_t*)(q + LUA_TOP_OFF);
                     static int dbg_probe = 0;
                     if (vg >= 0x100000000ULL && vg <= 0x16000000000ULL && dbg_probe < 60) {
                         dbg_probe++;
-                        LOG_CORE("  +0x%03lx -> %p b0=%02x b8=%02x g=%#llx stk=%#llx top=%#llx",
-                                 (unsigned long)off, (void*)v, q[0], q[8],
+                        LOG_CORE("  +0x%03lx -> %p b1=%02x g=%#llx stk=%#llx top=%#llx",
+                                 (unsigned long)off, (void*)v, q[LUA_TT_OFF],
                                  (unsigned long long)vg,
                                  (unsigned long long)vstk,
                                  (unsigned long long)vtop);
@@ -875,7 +939,7 @@ static void* hunter_thread(void* arg) {
             }
         }
         if (!verified)
-            LOG_CORE("instance %d: no verified lua_State in 0x800 bytes", i);
+            LOG_CORE("instance %d: no verified lua_State in scanned window", i);
     }
 
     g_scan_done = true;
@@ -963,7 +1027,8 @@ extern "C" void executor_set_identity(lua_State* L, int identity, uint64_t capab
     es->identity = identity;
     es->capabilities = capabilities;
 
-    if (es->shared && is_memory_readable((uintptr_t)es->shared)) {
+    if (es->shared && is_memory_readable((uintptr_t)es->shared) &&
+        is_memory_writable((uintptr_t)es->shared)) {
         es->shared->identity = identity;
         es->shared->capabilities = capabilities;
     }
@@ -1085,8 +1150,7 @@ extern "C" void hook_check(uintptr_t x0, uintptr_t x1, uintptr_t slot_idx) {
 
         uint8_t buf[0x50];
         if (!safe_read(c, buf, sizeof(buf))) continue;
-        uint8_t tt = buf[8];
-        if (tt != 9) continue;
+        if (buf[0] != 0xA) continue;   /* tt @ +0 (0.740) */
 
         bool strict = looks_like_lua_state_safe(c);
         g_vhook_slot   = slot_idx;
@@ -1317,9 +1381,369 @@ extern "C" uintptr_t executor_image_slide(void) {
     return g_text_base ? (g_text_base - 0x100000000ULL) : 0;
 }
 
+/* ==================================================================== */
+/* Version-agnostic symbol resolution + version guard.                  */
+/*                                                                      */
+/* Every link-time address in this file was captured from one client    */
+/* build. Roblox re-links on every update, so a stale constant silently */
+/* points into whatever now lives at that offset — the failure mode is  */
+/* a crash in the middle of a resume, indistinguishable from a real     */
+/* bug. `LEGACY_CLIENT_VERSION` pins the only build the constants are   */
+/* valid for; on anything else a symbol must come from the resolver     */
+/* (luau_resolver.h) or the call is refused with the exact name of what */
+/* could not be resolved.                                              */
+/* ==================================================================== */
+
+#define LEGACY_CLIENT_VERSION "0.735.0.7351131"
+
+enum {
+    EXEC_FN_NEWTHREAD = 0,
+    EXEC_FN_RESUME,
+    EXEC_FN_BUfload,
+    EXEC_FN_PCALL,
+    EXEC_FN_RAWLOAD,
+    EXEC_FN_COMPILE,
+    EXEC_FN_INTERN,
+    EXEC_FN_LOADSTRING,
+    EXEC_FN_COUNT
+};
+
+typedef struct {
+    const char* name;      /* how the exec pipeline refers to it */
+    const char* sym;       /* name in lr_symbol_table, NULL = no anchor */
+    uintptr_t   legacy;    /* link-time address valid only for the legacy build */
+    uintptr_t   resolved;  /* runtime address from the resolver */
+    int         tried;     /* resolution is a full code scan — run it once */
+} exec_fn_t;
+
+static exec_fn_t g_exec_fn[EXEC_FN_COUNT] = {
+    { "lua_newthread", "lua_newthread", 0, 0, 0 },
+    { "lua_resume",    "lua_resume",    0, 0, 0 },
+    { "luau_load",     "luau_load",     0, 0, 0 },
+    { "lua_pcall",     "lua_pcall",     0, 0, 0 },
+    { "rawload",       "rawload",       0, 0, 0 },
+    { "compile",       "compile",       0, 0, 0 },
+    { "luaS_newlstr",  NULL,            0, 0, 0 },
+    { "loadstring",    "loadstring",    0, 0, 0 },
+};
+
+static char    g_client_version[64];
+static uint8_t g_image_uuid[16];
+static int     g_version_state = 0;   /* 0 = not tried, 1 = ok, -1 = failed */
+
+/* /Applications/Roblox.app/Contents/MacOS/RobloxPlayer -> .../Contents/Info.plist
+ * Both XML and binary plists keep the version as plain ASCII digits, so a
+ * scan for the first N.N.N.N token after CFBundleVersion works for either. */
+static void read_client_version(void) {
+    if (g_version_state) return;
+    g_version_state = -1;
+    char exe[1024];
+    uint32_t exe_len = sizeof(exe);
+    if (_NSGetExecutablePath(exe, &exe_len) != 0) return;
+    char* p = strrchr(exe, '/');
+    if (!p) return;
+    *p = 0;
+    p = strrchr(exe, '/');
+    if (!p) return;
+    snprintf(p, sizeof(exe) - (size_t)(p - exe), "/Info.plist");
+
+    int fd = open(exe, O_RDONLY);
+    if (fd < 0) {
+        LOG_CORE("VER: cannot open %s", exe);
+        return;
+    }
+    static char buf[256 * 1024];   /* too big for a payload thread's stack */
+    ssize_t got = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (got <= 0) return;
+    buf[got] = 0;
+
+    const char* hay = strstr(buf, "CFBundleVersion");
+    if (!hay) hay = buf;
+    for (const char* q = hay; *q; q++) {
+        if (!isdigit((unsigned char)*q)) continue;
+        if (q != hay && (isdigit((unsigned char)q[-1]) || q[-1] == '.')) continue;
+        const char* scan = q;
+        int parts = 0;
+        while (parts < 4) {
+            int digits = 0;
+            while (isdigit((unsigned char)*scan)) { scan++; digits++; }
+            if (digits < 1 || digits > 5) break;
+            parts++;
+            if (parts < 4) {
+                if (*scan != '.') break;
+                scan++;
+            }
+        }
+        if (parts == 4) {
+            size_t len = (size_t)(scan - q);
+            if (len < sizeof(g_client_version)) {
+                memcpy(g_client_version, q, len);
+                g_client_version[len] = 0;
+                g_version_state = 1;
+                return;
+            }
+        }
+    }
+}
+
+extern "C" const char* executor_client_version(void) {
+    read_client_version();
+    return g_client_version[0] ? g_client_version : "unknown";
+}
+
+static void read_image_uuid(void) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    const struct mach_header_64* hdr = find_roblox_header();
+    if (!hdr) return;
+    const struct load_command* lc = (const struct load_command*)(hdr + 1);
+    for (uint32_t i = 0; i < hdr->ncmds; i++) {
+        if (lc->cmd == LC_UUID) {
+            memcpy(g_image_uuid, ((const struct uuid_command*)lc)->uuid, 16);
+            return;
+        }
+        lc = (const struct load_command*)((const uint8_t*)lc + lc->cmdsize);
+    }
+}
+
+/* One lr_image_t over the live RobloxPlayer image: runtime addresses, reads
+ * through the kernel, chunk buffer for the scans. */
+static lr_section_t g_img_sections[LR_MAX_SECTIONS];
+static int          g_img_nsections = 0;
+static uint8_t*     g_img_scratch = NULL;
+static lr_image_t   g_img;
+static int          g_img_state = 0;  /* 0 = not built, 1 = ok, -1 = failed */
+
+static int img_reader(void* ctx, uintptr_t addr, void* dst, size_t len) {
+    (void)ctx;
+    return safe_read(addr, dst, len) ? 1 : 0;
+}
+
+static int build_self_image(void) {
+    if (g_img_state) return g_img_state > 0;
+    g_img_state = -1;
+    const struct mach_header_64* hdr = find_roblox_header();
+    if (!hdr) return 0;
+
+    uintptr_t slide = 0;
+    const struct load_command* lc = (const struct load_command*)(hdr + 1);
+    for (uint32_t i = 0; i < hdr->ncmds; i++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64* seg = (const struct segment_command_64*)lc;
+            if (strncmp(seg->segname, "__TEXT", 16) == 0) {
+                slide = (uintptr_t)hdr - seg->vmaddr;
+                break;
+            }
+        }
+        lc = (const struct load_command*)((const uint8_t*)lc + lc->cmdsize);
+    }
+
+    int n = 0;
+    lc = (const struct load_command*)(hdr + 1);
+    for (uint32_t i = 0; i < hdr->ncmds && n < LR_MAX_SECTIONS; i++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64* seg = (const struct segment_command_64*)lc;
+            const struct section_64* sects = (const struct section_64*)(seg + 1);
+            for (uint32_t s = 0; s < seg->nsects && n < LR_MAX_SECTIONS; s++) {
+                const struct section_64* sec = &sects[s];
+                uint32_t type = sec->flags & SECTION_TYPE;
+                if (type == S_ZEROFILL || type == S_THREAD_LOCAL_ZEROFILL) continue;
+                if (sec->size < 4) continue;
+                uintptr_t addr = sec->addr + slide;
+                if (!is_memory_readable(addr) ||
+                    !is_memory_readable(addr + sec->size - 4)) continue;
+                g_img_sections[n].vmaddr = addr;
+                g_img_sections[n].size   = sec->size;
+                g_img_sections[n].is_code =
+                    (sec->flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)) != 0;
+                g_img_sections[n].label  = NULL;
+                n++;
+            }
+        }
+        lc = (const struct load_command*)((const uint8_t*)lc + lc->cmdsize);
+    }
+    if (!n) {
+        LOG_CORE("RESOLVE: no usable sections in the image");
+        return 0;
+    }
+    if (!g_img_scratch) g_img_scratch = (uint8_t*)malloc(1 << 20);
+    if (!g_img_scratch) return 0;
+
+    g_img_nsections  = n;
+    g_img.sections   = g_img_sections;
+    g_img.n_sections = n;
+    g_img.read       = img_reader;
+    g_img.ctx        = NULL;
+    g_img.scratch    = g_img_scratch;
+    g_img.scratch_len = 1 << 20;
+    g_img_state = 1;
+    return 1;
+}
+
+static int legacy_client(void) {
+    read_client_version();
+    return g_client_version[0] &&
+           strcmp(g_client_version, LEGACY_CLIENT_VERSION) == 0;
+}
+
+static uintptr_t resolve_one(const char* sym_name, int* status_out) {
+    if (status_out) *status_out = LR_ERR_NO_IMAGE;
+    if (!sym_name || !build_self_image()) return 0;
+    const lr_symbol_t* sym = lr_symbol_by_name(sym_name);
+    if (!sym) return 0;
+    lr_sym_result_t r;
+    int rc = lr_resolve_symbol(&g_img, sym, &r);
+    if (status_out) *status_out = rc;
+    if (rc != LR_OK || !r.res.fn) return 0;
+    if (!lr_section_for(&g_img, r.res.fn, 1)) return 0;
+    return r.res.fn;
+}
+
+static uintptr_t resolve_pipeline_symbol(int which) {
+    if (which < 0 || which >= EXEC_FN_COUNT) return 0;
+    exec_fn_t* f = &g_exec_fn[which];
+    if (f->resolved) return f->resolved;
+    if (f->sym) {
+        f->resolved = resolve_one(f->sym, NULL);
+    }
+    if (!f->resolved) {
+        if (!build_self_image()) return 0;
+        if (strcmp(f->name, "lua_newthread") == 0) {
+            lr_newthread_result_t nt;
+            if (lr_derive_newthread(&g_img, &nt) == LR_OK && nt.fn) f->resolved = nt.fn;
+        } else if (strcmp(f->name, "lua_pcall") == 0) {
+            uintptr_t pcall_fn = 0, xpcall_fn = 0;
+            if (lr_derive_pcall(&g_img, &pcall_fn, &xpcall_fn) == LR_OK) f->resolved = pcall_fn;
+        } else if (strcmp(f->name, "rawload") == 0 || strcmp(f->name, "compile") == 0) {
+            uintptr_t ls_wrapper = 0, luau_load_fn = 0;
+            const lr_symbol_t* s_ls  = lr_symbol_by_name("loadstring");
+            const lr_symbol_t* s_lld = lr_symbol_by_name("luau_load");
+            if (s_ls) {
+                lr_sym_result_t r;
+                if (lr_resolve_symbol(&g_img, s_ls, &r) == LR_OK) ls_wrapper = r.res.fn;
+            }
+            if (s_lld) {
+                lr_sym_result_t r;
+                if (lr_resolve_symbol(&g_img, s_lld, &r) == LR_OK) luau_load_fn = r.res.fn;
+            }
+            uintptr_t rawload = lr_derive_rawload(&g_img, luau_load_fn, ls_wrapper);
+            uintptr_t comp = lr_derive_compile(&g_img, ls_wrapper, rawload);
+            g_exec_fn[EXEC_FN_RAWLOAD].resolved = rawload;
+            g_exec_fn[EXEC_FN_COMPILE].resolved = comp;
+        } else if (strcmp(f->name, "lua_resume") == 0) {
+            uintptr_t res = lr_derive_resume(&g_img);
+            if (res) f->resolved = res;
+        }
+    }
+    return f->resolved;
+}
+
+/* Runtime address of a symbol the exec pipeline needs, or 0 when it cannot be
+ * resolved on this client build. The legacy constant is only ever used when
+ * the client really is the build it came from. */
+static uintptr_t exec_fn_addr(int which) {
+    if (which < 0 || which >= EXEC_FN_COUNT) return 0;
+    exec_fn_t* f = &g_exec_fn[which];
+    if (!f->tried) {
+        f->tried = 1;
+        resolve_pipeline_symbol(which);
+    }
+    if (f->resolved) return f->resolved;
+    if (f->legacy && legacy_client()) {
+        LOG_CORE("RESOLVE: %s via legacy %s constant (client matches)",
+                 f->name, LEGACY_CLIENT_VERSION);
+        return f->legacy + executor_image_slide();
+    }
+    if (f->legacy && !legacy_client())
+        LOG_CORE("RESOLVE: %s unresolved on client %s — legacy constant %#llx is "
+                 "NOT valid here and was refused",
+                 f->name, executor_client_version(),
+                 (unsigned long long)(f->legacy + executor_image_slide()));
+    return 0;
+}
+
+extern "C" int executor_resolve(char* buf, size_t len) {
+    int n = 0;
+    read_client_version();
+    read_image_uuid();
+    if (!build_self_image()) {
+        return snprintf(buf, len, "ERR: cannot build an image view of RobloxPlayer\n");
+    }
+    uintptr_t text_lo = 0, text_hi = 0;
+    for (int i = 0; i < g_img_nsections; i++) {
+        if (!g_img_sections[i].is_code) continue;
+        if (!text_lo || g_img_sections[i].vmaddr < text_lo) text_lo = g_img_sections[i].vmaddr;
+        uintptr_t end = g_img_sections[i].vmaddr + g_img_sections[i].size;
+        if (end > text_hi) text_hi = end;
+    }
+    n += snprintf(buf + n, len - n,
+                  "client=%s  uuid=%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n"
+                  "slide=%#lx  sections=%d  code=%#lx-%#lx\n"
+                  "legacy constants valid for: %s (%s)\n\n",
+                  executor_client_version(),
+                  g_image_uuid[0], g_image_uuid[1], g_image_uuid[2], g_image_uuid[3],
+                  g_image_uuid[4], g_image_uuid[5], g_image_uuid[6], g_image_uuid[7],
+                  g_image_uuid[8], g_image_uuid[9], g_image_uuid[10], g_image_uuid[11],
+                  g_image_uuid[12], g_image_uuid[13], g_image_uuid[14], g_image_uuid[15],
+                  (unsigned long)executor_image_slide(), g_img_nsections,
+                  (unsigned long)text_lo, (unsigned long)text_hi,
+                  LEGACY_CLIENT_VERSION,
+                  legacy_client() ? "MATCHES running client" : "does NOT match running client");
+
+    n += snprintf(buf + n, len - n, "-- anchor resolution --\n");
+    for (int i = 0; i < LR_SYMBOL_COUNT && n < (int)len - 256; i++) {
+        lr_sym_result_t r;
+        int rc = lr_resolve_symbol(&g_img, &lr_symbol_table[i], &r);
+        if (rc == LR_OK && r.res.fn) {
+            n += snprintf(buf + n, len - n,
+                          "%-15s @ %#lx  exact=%d/%d  fns=%d  verified=%d%s\n",
+                          r.name, (unsigned long)r.res.fn, r.res.xrefs,
+                          r.res.occurrences, r.res.distinct_fn, r.verified_extra,
+                          r.res.boundary_proven ? "" : " [entry unproven]");
+        } else {
+            const char* why = rc == LR_ERR_NO_ANCHOR ? "no anchor for this symbol" :
+                              rc == LR_ERR_NO_STRING ? "anchor string absent" :
+                              rc == LR_ERR_NO_XREF   ? "no confirmed code xref" :
+                              rc == LR_ERR_NO_PROLOGUE ? "no function entry found" :
+                                                        "unresolved";
+            n += snprintf(buf + n, len - n, "%-15s -- %s\n", r.name, why);
+        }
+    }
+
+    n += snprintf(buf + n, len - n, "\n-- exec pipeline --\n");
+    int missing = 0;
+    for (int i = 0; i < EXEC_FN_COUNT; i++) {
+        exec_fn_t* f = &g_exec_fn[i];
+        f->tried = 1;
+        resolve_pipeline_symbol(i);
+        if (f->resolved) {
+            n += snprintf(buf + n, len - n, "%-15s OK    %#lx%s\n",
+                          f->name, (unsigned long)f->resolved,
+                          f->sym ? "" : " (derived)");
+        } else if (!legacy_client() && f->legacy) {
+            missing++;
+            n += snprintf(buf + n, len - n,
+                          "%-15s MISSING (legacy %#llx refused: client %s)\n",
+                          f->name, (unsigned long long)f->legacy,
+                          executor_client_version());
+        } else {
+            n += snprintf(buf + n, len - n, "%-15s (no legacy constant)\n", f->name);
+        }
+    }
+    n += snprintf(buf + n, len - n,
+                  "\nverdict: %s\n",
+                  missing == 0 ? "execution symbols available" :
+                                 "execution blocked until the missing symbols are derived "
+                                 "(no legacy constant will be substituted)");
+    return n;
+}
+
 /* First pass over RW regions looking for a tt==9 thread object.
- * Mutual-reference invariant from 0x102c4afe0: [L+0x30] == G and
- * [G+0x18] == L, i.e. [[L+0x30]+0x18] == L. Chunk-local reads only. */
+ * Mutual-reference invariant 0.739: [L+0x48] == G and [G+0x90] == L
+ * (proved offline: lua_pushthread tail reads [x0+0x48] then [x8+0x90]).
+ * Chunk-local reads only. */
 static uintptr_t g_tt9_cands[24];
 static int g_tt9_count = 0;
 /* known real threads (validated layout) and cross-references to them */
@@ -1368,7 +1792,8 @@ static void find_live_thread(void) {
             if (g_coro_cnt[q] > bestn) { bestn = g_coro_cnt[q]; gbest = g_coro_G[q]; }
         /* direct deterministic mainthreads of ALL lua universes:
          * every distinct G seen among fresh coroutines contributes its
-         * [G+0x88] mainthread; loadstring availability differs per universe */
+         * [G+0x90] mainthread (0.739 offset; 0.735 used 0x88); loadstring
+         * availability differs per universe */
         {
             int stored_mains = 0;
             for (int q = 0; q < g_coro_n && stored_mains < 8; q++) {
@@ -1376,14 +1801,14 @@ static void find_live_thread(void) {
                 if (gb2 < 0x100000000ULL || gb2 > 0x16000000000ULL || (gb2 & 0xF) != 0)
                     continue;
                 uintptr_t mt = 0;
-                safe_read(gb2 + 0x88, &mt, 8);
+                safe_read(gb2 + 0x90, &mt, 8);
                 if (mt < 0x100000000ULL || mt > 0x16000000000ULL || (mt & 0xF) != 0) {
                     LOG_CORE("EXEC: u=%d g=%p bad mt=%#llx", q, (void*)gb2,
                              (unsigned long long)mt);
                     continue;
                 }
                 uintptr_t mg = 0;
-                safe_read(mt + 0x30, &mg, 8);
+                safe_read(mt + 0x48, &mg, 8);
                 if (mg != gb2) {
                     LOG_CORE("EXEC: u=%d mt=%p backref=%#llx != g", q, (void*)mt,
                              (unsigned long long)mg);
@@ -1452,15 +1877,20 @@ static void find_live_thread(void) {
                     if (mach_vm_read_overwrite(mach_task_self(), cbase,
                                                (1 << 20), (mach_vm_address_t)chunk,
                                                &got) != KERN_SUCCESS) break;
-                    for (mach_vm_size_t i = 0; i + 0x70 <= got; i += 8) {
+                    for (mach_vm_size_t i = 0; i + 0x88 <= got; i += 8) {
                         uintptr_t L = cbase + i;
                         if ((L & 0xF) != 0) continue;
-                        if (chunk[i + 8] == 9) c_tt9++;
-                        /* disassembly-derived lua_State layout: plain pointers, no masking */
-                        uintptr_t g   = *(uintptr_t*)(chunk + i + 0x30);
-                        uintptr_t stk = *(uintptr_t*)(chunk + i + 0x38);
-                        uintptr_t lci = *(uintptr_t*)(chunk + i + 0x50);
-                        uintptr_t top = *(uintptr_t*)(chunk + i + 0x58);
+                        if (chunk[i + LUA_TT_OFF] != 0xA) continue;   /* tt @ +1 (0.741) */
+                        c_tt9++;
+                        /* 0.741 layout (luaE_newthread + stack_init + tothread):
+                         * tt@+1, status@+3, magic(u32)^0x2d@+0x18, G@+0x68,
+                         * base@+0x60, top@+0x70, stack@+0x78, last@+0x80.
+                         * The old 8-vs-9 tt contradiction here made this
+                         * function return false unconditionally. */
+                        uintptr_t g   = *(uintptr_t*)(chunk + i + LUA_G_OFF);
+                        uintptr_t stk = *(uintptr_t*)(chunk + i + LUA_STACK_OFF);
+                        uintptr_t lci = *(uintptr_t*)(chunk + i + LUA_INNER_OFF);
+                        uintptr_t top = *(uintptr_t*)(chunk + i + LUA_TOP_OFF);
                         if ((top >> 56) == 0xca)
                             top = ((top >> 32) & 0xffffff) << 32 | (top & 0xffffffff);
                         if (g < 0x100000000ULL || g > 0x16000000000ULL) continue;
@@ -1487,26 +1917,73 @@ static void find_live_thread(void) {
                                 }
                             }
                         }
+                         /* ---- fast path (0.741): magic + structure + G-strt ---- */
+                        {
+                            int pri = 8;
+                            uint32_t magic = *(uint32_t*)(chunk + i + LUA_MAGIC_OFF);
+                            if (magic == ((uint32_t)((L + LUA_MAGIC_OFF) & 0xffffffffULL) ^ 0x2du))
+                                pri += 16;
+                            uintptr_t blk = *(uintptr_t*)(chunk + i + LUA_STACK_OFF);
+                            uintptr_t lim = *(uintptr_t*)(chunk + i + LUA_SLAST_OFF);
+                            if (blk >= 0x100000000ULL && blk <= 0x16000000000ULL &&
+                                lim > blk && lim - blk <= 0x100000ULL) {
+                                pri += 8;
+                                if (*(uintptr_t*)(chunk + i + LUA_INNER_OFF) ==
+                                    *(uintptr_t*)(chunk + i + LUA_INNER_OFF + 8)) pri += 4;
+                            }
+                            /* mandatory: top lives in the stack block (a
+                             * parked main can sit slightly below base) — this
+                             * alone kills the tag-array false positives */
+                            int top_ok = top >= stk - 0x1000ULL &&
+                                         top - stk <= 0x400000ULL &&
+                                         ((top - stk) & 0xF) == 0 &&
+                                         blk >= 0x100000000ULL &&
+                                         blk <= 0x16000000000ULL;
+                            if (top_ok) {
+                                if (g_strt_ok(g)) pri += 20;
+                                c_final++;
+                                int dup = 0;
+                                for (int q = 0; q < g_live_n; q++)
+                                    if (g_live_L[q] == L) { dup = 1; break; }
+                                if (!dup && g_live_n < MAX_LIVE_CANDS) {
+                                    thr_register(L);
+                                    g_live_L[g_live_n] = L;
+                                    g_live_ss[g_live_n] = lci;
+                                    g_live_stack[g_live_n] = stk;
+                                    g_live_top[g_live_n] = top;
+                                    g_live_tp[g_live_n] = top;
+                                    g_live_pri[g_live_n] = pri;
+                                    LOG_CORE("EXEC: L741 L=%p g=%p stk=%#llx top=%#llx pri=%d",
+                                             (void*)L, (void*)g,
+                                             (unsigned long long)stk,
+                                             (unsigned long long)top, pri);
+                                    g_live_n++;
+                                }
+                                continue;
+                            }
+                        }
                         /* ---- Phase A: fresh-coroutine signature, exact
-                         * postconditions of init (0x102c52a88):
-                         * [L+0]=0xA, [L+0x10]=low32(L+0x10)+0x2d, [L+0x14]=8,
-                         * stk=[L+0x38]=sa+0x10, sa=[L+0x40], sl=[L+0x48]=sa+0x280,
-                         * top=[L+0x58]=stk, ci=[L+0x50]=[L+0x68], [L+0x60]=ci+0x150.
+                         * postconditions of stack_init (0x1026f3570):
+                         * [L+1]=0xA, [L+0x18]=low32(L+0x18)^0x2d, [L+0x1c]=8,
+                         * B(stack)=[L+0x78], base=[L+0x60]=B+0x10,
+                         * top=[L+0x70]=B+0x10, last=[L+0x80]=B+0x280,
+                         * inner A=[L+0x50]=[L+0x58].
                          * All coroutines share one G -> reveals the real global_State */
-                        if (chunk[i] == 0xA &&
-                            *(uint32_t*)(chunk + i + 0x10) ==
-                                (uint32_t)((L + 0x10) & 0xffffffffULL) + 0x2d &&
-                            *(uint32_t*)(chunk + i + 0x14) == 8) {
-                            uintptr_t c_sa  = *(uintptr_t*)(chunk + i + 0x40);
+                        if (chunk[i + LUA_TT_OFF] == 0xA &&
+                            *(uint32_t*)(chunk + i + LUA_MAGIC_OFF) ==
+                                ((uint32_t)((L + LUA_MAGIC_OFF) & 0xffffffffULL) ^ 0x2d) &&
+                            *(uint32_t*)(chunk + i + LUA_NUM8_OFF) == 8) {
+                            uintptr_t c_sa  = *(uintptr_t*)(chunk + i + LUA_STACK_OFF);
                             uintptr_t c_stk = stk;
-                            uintptr_t c_sl  = *(uintptr_t*)(chunk + i + 0x48);
-                            uintptr_t c_cil = *(uintptr_t*)(chunk + i + 0x60);
-                            uintptr_t c_cib = *(uintptr_t*)(chunk + i + 0x68);
+                            uintptr_t c_sl  = *(uintptr_t*)(chunk + i + LUA_SLAST_OFF);
+                            uintptr_t c_cil = *(uintptr_t*)(chunk + i + LUA_TOP_OFF);
+                            uintptr_t c_cib = *(uintptr_t*)(chunk + i + LUA_BASE_OFF);
+                            uintptr_t c_ina = *(uintptr_t*)(chunk + i + LUA_INNER_OFF);
                             if (c_sa >= 0x100000000ULL && c_sa <= 0x16000000000ULL &&
-                                c_stk == c_sa + 0x10 && c_sl == c_sa + 0x280 &&
-                                top == c_stk &&
-                                c_cil == c_cib + 0x150 && lci == c_cib &&
-                                c_cib >= 0x100000000ULL && c_cib <= 0x16000000000ULL) {
+                                c_stk == c_sa && c_sl == c_sa + 0x280 &&
+                                top == c_sa + 0x10 && c_cil == c_sa + 0x10 &&
+                                c_cib == c_sa + 0x10 && c_ina == lci &&
+                                lci >= 0x100000000ULL && lci <= 0x16000000000ULL) {
                                 int seen = -1;
                                 for (int q = 0; q < g_coro_n; q++)
                                     if (g_coro_G[q] == g) { seen = q; break; }
@@ -1855,39 +2332,15 @@ static int executor_hook_pcall(uintptr_t fn) {
 static bool lua_state_usable(uintptr_t L) {
     if (L < 0x100000000ULL || L > 0x16000000000ULL) return false;
     if ((L & 0xF) != 0) return false;
-    uint8_t lh[0x70];
+    uint8_t lh[0x88];
     if (!safe_read(L, lh, sizeof(lh))) return false;
-    uintptr_t g = *(uintptr_t*)(lh + 0x30);
+    if (lh[LUA_TT_OFF] != 0xA) return false;   /* tt @ +1 (0.741) */
+    uintptr_t g = *(uintptr_t*)(lh + LUA_G_OFF);
     if (g < 0x100000000ULL || g > 0x16000000000ULL) return false;
     if ((g & 0xF) != 0) return false;
-    uintptr_t d = (g > L) ? (g - L) : (L - g);
-    if (d <= 0x100 || d > 0x40000ULL) return false;
-    uint8_t gv[0x50];
-    if (!safe_read(g, gv, sizeof(gv))) return false;
-    uintptr_t bucket = *(uintptr_t*)(gv + 0);
-    uint64_t gsize = *(uint32_t*)(gv + 8);
-    uint64_t gnuse = *(uint32_t*)(gv + 0xc);
-    if (bucket < 0x100000000ULL || bucket > 0x16000000000ULL) return false;
-    if (gsize < 0x20 || gsize > 0x1000000ULL) return false;
-    if (gnuse > gsize * 2) return false;
-    /* bucket sample: non-null entries must look like TStrings */
-    uint64_t bs[16];
-    memset(bs, 0, sizeof(bs));
-    if (!safe_read(bucket, bs, sizeof(bs))) return false;
-    for (int k = 0; k < 16; k++) {
-        if (bs[k] == 0) continue;
-        if (bs[k] < 0x100000000ULL || bs[k] > 0x16000000000ULL || (bs[k] & 7) != 0)
-            return false;
-        uint8_t sbuf[0x18];
-        if (!safe_read(bs[k], sbuf, sizeof(sbuf))) return false;
-        uint32_t slen = *(uint32_t*)(sbuf + 0x14);
-        if (slen == 0 || slen > 0x100000) return false;
-        uint64_t snext = *(uint64_t*)(sbuf + 8);
-        if (snext != 0 && (snext < 0x100000000ULL || snext > 0x16000000000ULL))
-            return false;
-    }
-    uintptr_t stack = *(uintptr_t*)(lh + 0x38);
-    uintptr_t top = *(uintptr_t*)(lh + 0x58);
+    if (!g_strt_ok(g)) return false;
+    uintptr_t stack = *(uintptr_t*)(lh + LUA_STACK_OFF);
+    uintptr_t top = *(uintptr_t*)(lh + LUA_TOP_OFF);
     if (stack < 0x100000000ULL || stack > 0x16000000000ULL) return false;
     if ((top >> 56) == 0xca)
         top = ((top >> 32) & 0xffffff) << 32 | (top & 0xffffffff);
@@ -1924,6 +2377,12 @@ static bool patch_insn_remapped(uintptr_t addr, uint32_t insn) {
 static int patch_loadstring_gate(uintptr_t slide) {
     static int done = 0;
     if (done) return 0;
+    if (!legacy_client()) {
+        LOG_CORE("PATCH: refused — gate offsets belong to %s, running client is %s",
+                 LEGACY_CLIENT_VERSION, executor_client_version());
+        done = -1;
+        return -1;
+    }
     uintptr_t a1 = 0x101541310ULL + slide;
     uintptr_t a2 = 0x10154131cULL + slide;
     uintptr_t a3 = 0x10153530cULL + slide; /* "loadstring enabled" getter */
@@ -1971,6 +2430,7 @@ static int exec_gamestate_legacy(const char* code, char* out, size_t out_len) {
     uintptr_t fn_intern = 0x102c535b8ULL + slide;
     uintptr_t fn_loadstr = 0x1015412a8ULL + slide;
     uintptr_t fn_pcall = 0x102c3b1ccULL + slide;
+    uintptr_t fn_rawload = 0x101533becULL + slide;
     int n = 0;
 
     find_live_thread();
@@ -2016,7 +2476,7 @@ static int exec_gamestate_legacy(const char* code, char* out, size_t out_len) {
         n = 0;
         n += snprintf(out + n, out_len - n, "L=%p slide=%#lx (cand %d/%d)\n", (void*)L, slide, ci + 1, g_live_n);
 
-        uintptr_t Lg = *(uintptr_t*)(L + 0x30);
+        uintptr_t Lg = *(uintptr_t*)(L + 0x48);   /* 0.739: L->G */
         uint64_t gchk[2] = {0, 0};
         uint8_t* gbuf = (uint8_t*)&gchk;
         if (Lg >= 0x100000000ULL && Lg < 0x16000000000ULL && safe_read(Lg, gbuf, 16)) {
@@ -2153,11 +2613,11 @@ static int exec_gamestate_legacy(const char* code, char* out, size_t out_len) {
      * byte9/binary-ref only boost priority */
     uintptr_t glue = 0;
     safe_read(L + 0x78, &glue, 8);
-    /* deterministic main-thread identity: G->mainthread at [G+0x88]
-     * (verified live: [[G+0x88]+0x30] == G, init-exact stack layout,
-     * non-null glue) */
+    /* deterministic main-thread identity: G->mainthread at [G+0x90]
+     * (0.739 offsets; proved offline via lua_pushthread tail:
+     *  G=[L+0x48], mainthread=[G+0x90]) */
     uintptr_t mt = 0;
-    safe_read(Lg + 0x88, &mt, 8);
+    safe_read(Lg + 0x90, &mt, 8);
     int is_main = (mt == L);
     if (!is_main || glue < 0x100000000ULL || glue > 0x16000000000ULL) {
         LOG_CORE("EXEC: SKIP L=%p glue=%#llx mt=%#llx pri=%d", (void*)L,
@@ -2174,7 +2634,6 @@ static int exec_gamestate_legacy(const char* code, char* out, size_t out_len) {
     int rr = -9;
     int r2 = -9;
     {
-        uintptr_t fn_rawload = 0x101533becULL + slide;
         size_t clen = strlen(code);
         char sso[32];
         memset(sso, 0, sizeof(sso));
@@ -2347,24 +2806,29 @@ static uintptr_t unpack_top(uintptr_t tp) {
     return tp;
 }
 
-/* Deterministic main-thread check: G=[L+0x30], G->mainthread=[G+0x88]==L,
- * backref [[L+0x30]]==G. Glue [L+0x78] is informational only: in-game main
- * threads can carry a NULL glue (verified live); the compile->loader->resume
- * pipeline never dereferences the parent's glue. */
+/* Deterministic main-thread check (0.741): tt@+1, G=[L+0x68], anti-forgery
+ * magic at +0x18, G references its main thread somewhere in its first
+ * 0x2c0 bytes. The compile->loader->resume pipeline never dereferences
+ * the parent's glue (on 0.741 the old +0x78 glue slot is the value
+ * stack — it must not be touched). */
 static bool validate_main_thread(uintptr_t L) {
     if (L < 0x100000000ULL || L > 0x16000000000ULL || (L & 0xF) != 0) return false;
-    uintptr_t G = 0, mt = 0, mtg = 0;
-    if (!safe_read(L + 0x30, &G, 8)) return false;
+    uint8_t lh[0x88];
+    if (!safe_read(L, lh, sizeof(lh))) return false;
+    if (lh[LUA_TT_OFF] != 0xA) return false; /* tt @ +1 (0.741) */
+    uintptr_t G = *(uintptr_t*)(lh + LUA_G_OFF);
     if (G < 0x100000000ULL || G > 0x16000000000ULL || (G & 0xF) != 0) return false;
-    if (!safe_read(G + 0x88, &mt, 8) || mt != L) return false;
-    if (!safe_read(mt + 0x30, &mtg, 8) || mtg != G) return false;
-    uintptr_t stack = 0;
-    if (!safe_read(L + 0x38, &stack, 8)) return false;
+    uintptr_t stack = *(uintptr_t*)(lh + LUA_STACK_OFF);
     if (stack < 0x100000000ULL || stack > 0x16000000000ULL) return false;
-    /* NOTE: no top/stack span check — a parked main thread can carry its
-     * top BELOW stack (verified live); the compile->loader->resume pipeline
-     * never touches the parent's stack anyway. */
-    return true;
+    /* anti-forgery magic written by stack_init on every thread */
+    if (!lua_thread_magic_ok(L)) return false;
+    /* G references its main thread; the slot moved between versions (0.739
+     * was [G+0x90]) — locate the backref by content, not a fixed offset */
+    uint8_t gb[0x2c0];
+    if (!safe_read(G, gb, sizeof(gb))) return false;
+    for (int off = 0x20; off + 8 <= (int)sizeof(gb); off += 8)
+        if (*(uintptr_t*)(gb + off) == L) return true;
+    return false;
 }
 
 /* Returns the live game main thread, running the full heap hunt only when
@@ -2405,7 +2869,7 @@ static uintptr_t confirmed_main_thread(char* why, size_t why_len) {
                             size >= 0x4000 && size < 0x80000000ULL;
                 if (scan) {
                     mach_vm_size_t done = 0;
-                    while (done + 0x70 <= size) {
+                    while (done + 0x88 <= size) {
                         mach_vm_size_t want =
                             size - done < (1 << 20) ? size - done : (1 << 20);
                         mach_vm_size_t got = 0;
@@ -2414,10 +2878,14 @@ static uintptr_t confirmed_main_thread(char* why, size_t why_len) {
                                 (mach_vm_address_t)chunk, &got) != KERN_SUCCESS)
                             break;
                         for (mach_vm_size_t i = 0;
-                             i + 0x70 <= got && ngseen < 32; i += 8) {
+                             i + 0x88 <= got && ngseen < 32; i += 8) {
                             uintptr_t c = addr + done + i;
                             if ((c & 0xF) != 0) continue;
-                            uintptr_t G = *(uintptr_t*)(chunk + i + 0x30);
+                            if (chunk[i + LUA_TT_OFF] != 0xA) continue;
+                            if (*(uint32_t*)(chunk + i + LUA_MAGIC_OFF) !=
+                                ((uint32_t)((c + LUA_MAGIC_OFF) & 0xffffffffULL) ^ 0x2du))
+                                continue;
+                            uintptr_t G = *(uintptr_t*)(chunk + i + LUA_G_OFF);
                             if (G < 0x100000000ULL || G > 0x16000000000ULL ||
                                 (G & 0xF) != 0)
                                 continue;
@@ -2426,10 +2894,7 @@ static uintptr_t confirmed_main_thread(char* why, size_t why_len) {
                                 if (gseen[q] == G) { dup = 1; break; }
                             if (dup) continue;
                             /* string-table sanity on the G itself */
-                            uint8_t q0[0x10];
-                            if (safe_read(G, q0, 0x10) &&
-                                *(uint32_t*)(q0 + 8) >= 0x20 &&
-                                *(uint32_t*)(q0 + 8) <= 0x1000000ULL) {
+                            if (g_strt_ok(G)) {
                                 gseen[ngseen++] = G;
                                 LOG_CORE("MAIN: shape-universe G=%p", (void*)G);
                             }
@@ -2442,17 +2907,23 @@ static uintptr_t confirmed_main_thread(char* why, size_t why_len) {
             free(chunk);
         }
         for (int q = 0; q < ngseen; q++) {
+            /* 0.740: the mainthread slot moved — find any G backref */
             uintptr_t mt = 0;
-            if (!safe_read(gseen[q] + 0x88, &mt, 8)) continue;
-            if (!validate_main_thread(mt)) continue;
+            uint8_t gbuf2[0x2c0];
+            if (!safe_read(gseen[q], gbuf2, sizeof(gbuf2))) continue;
+            for (int off = 0x20; off + 8 <= (int)sizeof(gbuf2) && !mt; off += 8) {
+                uintptr_t cand = *(uintptr_t*)(gbuf2 + off);
+                if (validate_main_thread(cand)) mt = cand;
+            }
+            if (!mt) continue;
             int dup = 0;
             for (int z = 0; z < g_live_n; z++)
                 if (g_live_L[z] == mt) { dup = 1; break; }
             if (!dup && g_live_n < MAX_LIVE_CANDS) {
                 uintptr_t st = 0, tp = 0, ci = 0;
-                safe_read(mt + 0x38, &st, 8);
-                safe_read(mt + 0x58, &tp, 8);
-                safe_read(mt + 0x50, &ci, 8);
+                safe_read(mt + LUA_STACK_OFF, &st, 8);
+                safe_read(mt + LUA_TOP_OFF, &tp, 8);
+                safe_read(mt + LUA_INNER_OFF, &ci, 8);
                 g_live_L[g_live_n] = mt;
                 g_live_ss[g_live_n] = ci;
                 g_live_stack[g_live_n] = st;
@@ -2468,7 +2939,7 @@ static uintptr_t confirmed_main_thread(char* why, size_t why_len) {
     }
     if (best >= 0) {
         g_main_L = g_live_L[best];
-        safe_read(g_main_L + 0x30, &g_main_G, 8);
+        safe_read(g_main_L + 0x18, &g_main_G, 8);
         LOG_CORE("MAIN: confirmed+cached L=%p G=%p (cand %d/%d pri=%d)",
                  (void*)g_main_L, (void*)g_main_G, best + 1, g_live_n,
                  g_live_pri[best]);
@@ -2485,22 +2956,20 @@ static uintptr_t confirmed_main_thread(char* why, size_t why_len) {
  * the two TValues below top (with string extraction). */
 static void log_thread_state(const char* tag, uintptr_t L) {
     if (L < 0x100000000ULL || L > 0x16000000000ULL) return;
-    uint8_t q[0x80];
+    uint8_t q[0x88];
     if (!safe_read(L, q, sizeof(q))) {
         LOG_CORE("%s: L=%p UNREADABLE", tag, (void*)L);
         return;
     }
-    uintptr_t top = unpack_top(*(uintptr_t*)(q + 0x58));
-    LOG_CORE("%s: L=%p tt=%u st=%u ncc=%u b4=%u b5=%u G=%#llx base=%#llx sa=%#llx ci=%#llx top=%#llx bci=%#llx p70=%#llx glue=%#llx",
-             tag, (void*)L, q[0], q[3], *(uint16_t*)(q + 8), q[4], q[5],
-             (unsigned long long)*(uintptr_t*)(q + 0x30),
-             (unsigned long long)*(uintptr_t*)(q + 0x38),
-             (unsigned long long)*(uintptr_t*)(q + 0x40),
-             (unsigned long long)*(uintptr_t*)(q + 0x50),
+    uintptr_t top = unpack_top(*(uintptr_t*)(q + LUA_TOP_OFF));
+    LOG_CORE("%s: L=%p tt=%u status=%u G=%#llx stk=%#llx top=%#llx base=%#llx last=%#llx magic=%#x",
+             tag, (void*)L, q[LUA_TT_OFF], q[LUA_STATUS_OFF],
+             (unsigned long long)*(uintptr_t*)(q + LUA_G_OFF),
+             (unsigned long long)*(uintptr_t*)(q + LUA_STACK_OFF),
              (unsigned long long)top,
-             (unsigned long long)*(uintptr_t*)(q + 0x68),
-             (unsigned long long)*(uintptr_t*)(q + 0x70),
-             (unsigned long long)*(uintptr_t*)(q + 0x78));
+             (unsigned long long)*(uintptr_t*)(q + LUA_BASE_OFF),
+             (unsigned long long)*(uintptr_t*)(q + LUA_SLAST_OFF),
+             *(uint32_t*)(q + LUA_MAGIC_OFF));
     for (int i = -2; i < 0; i++) {
         uintptr_t slot = top + (uintptr_t)i * 0x10;
         if (slot < 0x100000000ULL || !is_memory_readable(slot)) continue;
@@ -2523,7 +2992,12 @@ static void log_thread_state(const char* tag, uintptr_t L) {
 
 /* co = lua_newthread(mainL), plus popping the TValue it pushes on main. */
 static uintptr_t exec_newthread(uintptr_t mainL) {
-    uintptr_t fn_newthread = 0x102c529f0ULL + executor_image_slide();
+    uintptr_t fn_newthread = exec_fn_addr(EXEC_FN_NEWTHREAD);
+    if (!fn_newthread) {
+        LOG_CORE("EXEC: lua_newthread unresolved on client %s — refusing to call "
+                 "a stale address", executor_client_version());
+        return 0;
+    }
     struct sigaction old_sa[2], old_alrm, sa;
     install_segv_guard(&sa, old_sa);
     install_alrm_guard(&sa, &old_alrm);
@@ -2542,18 +3016,25 @@ static uintptr_t exec_newthread(uintptr_t mainL) {
     remove_alrm_guard(&old_alrm);
     remove_segv_guard(&sa, old_sa);
     if (jv != 0 || co < 0x100000000ULL || co > 0x16000000000ULL) return 0;
-    if (is_memory_writable(mainL + 0x58)) {
-        uintptr_t mtp = 0;
-        safe_read(mainL + 0x58, &mtp, 8);
-        if ((mtp >> 56) != 0xca && mtp >= 0x100000000ULL)
-            *(uintptr_t*)(mainL + 0x58) = mtp - 0x10;
+    /* lua_newthread pushed the thread TValue onto main's stack — restore
+     * main's top so the parked main keeps its frame shape. */
+    uintptr_t mtp = 0;
+    if (safe_read(mainL + LUA_TOP_OFF, &mtp, 8) && mtp >= 0x100000000ULL && mtp <= 0x16000000000ULL) {
+        if (is_memory_writable(mainL + LUA_TOP_OFF)) {
+            if ((mtp >> 56) != 0xca && mtp >= 0x100000000ULL)
+                *(uintptr_t*)(mainL + LUA_TOP_OFF) = mtp - 0x10;
+        }
     }
     return co;
 }
 
 /* lua_resume(co, from=mainL, nargs=0) under the crash/timeout guard. */
 static int exec_resume(uintptr_t co, uintptr_t fromL) {
-    uintptr_t fn_resume = 0x102c48ab0ULL + executor_image_slide();
+    uintptr_t fn_resume = exec_fn_addr(EXEC_FN_RESUME);
+    if (!fn_resume) {
+        LOG_CORE("EXEC: lua_resume unresolved on client %s", executor_client_version());
+        return -10;
+    }
     struct sigaction old_sa[2], old_alrm, sa;
     install_segv_guard(&sa, old_sa);
     install_alrm_guard(&sa, &old_alrm);
@@ -2564,6 +3045,10 @@ static int exec_resume(uintptr_t co, uintptr_t fromL) {
     int jv = sigsetjmp(g_exec_jmp, 1);
     if (jv == 0) {
         try {
+            /* 0.741 lua_resume signature (disasm 0x1026e5a54): arg0 is the
+             * coroutine (values are copied onto its stack, its closure at
+             * stack slot 0 runs); `from` is arg1. 0.739/0.740 had the
+             * reverse order. */
             r = ((int(*)(uintptr_t, uintptr_t, int))fn_resume)(co, fromL, 0);
         } catch (const std::exception& e) {
             r = -3;
@@ -2579,25 +3064,105 @@ static int exec_resume(uintptr_t co, uintptr_t fromL) {
     return r;
 }
 
+/* The game's own script runner (live backtrace: every server script runs
+ * through it): 0x1026e8df0(thread, from_or_0, count) — protected-runs the
+ * function at thread.top - count*16 (the run_fn 0x1026e8f54 via
+ * rawrunprotected 0x1026e8250, with the G+0x6d0/G+0x678 thread hooks).
+ * Frame protocol: closure at stack slot 0 (ci->func = base-1), top = base
+ * (stack+0x10), count = 1, status = 0 (FRESH — status=1 would take the
+ * yield-continuation path and walk a garbage CallInfo chain). */
+static int exec_run(uintptr_t co) {
+    uintptr_t slide = executor_image_slide();
+    uintptr_t fn = 0x1026e8df0ULL + slide;
+    uint32_t first = 0;
+    if (!safe_read(fn, &first, 4) || first != 0xa9bd57f6u) {
+        LOG_CORE("EXEC: runner signature drifted (%#x) on %s",
+                 first, executor_client_version());
+        return -10;
+    }
+    struct sigaction old_sa[2], old_alrm, sa;
+    install_segv_guard(&sa, old_sa);
+    install_alrm_guard(&sa, &old_alrm);
+    alarm(15);
+    g_exec_segv = 0;
+    g_exec_timeout = 0;
+    int r = -9;
+    int jv = sigsetjmp(g_exec_jmp, 1);
+    if (jv == 0) {
+        try {
+            r = ((int (*)(uintptr_t, uintptr_t, int))fn)(co, 0, 0);
+        } catch (const std::exception& e) {
+            r = -3;
+            LOG_CORE("EXEC: run exc: %s", e.what());
+        } catch (...) {
+            r = -3;
+        }
+    }
+    remove_alrm_guard(&old_alrm);
+    remove_segv_guard(&sa, old_sa);
+    if (jv == 2 || g_exec_timeout) return -2;
+    if (jv == 1 || g_exec_segv) return -4;
+    return r;
+}
+
+/* lua_pcall(co, 0, MULTRET, 0) under the crash/timeout guard. The 0.741
+ * lua_resume only MOVES values (the actual run happens in the game's
+ * scheduler, which does not know about our coroutines) — lua_pcall is the
+ * synchronous runner that actually executes the closure. */
+static int exec_pcall(uintptr_t co) {
+    uintptr_t fn_pcall = exec_fn_addr(EXEC_FN_PCALL);
+    if (!fn_pcall) {
+        LOG_CORE("EXEC: lua_pcall unresolved on client %s", executor_client_version());
+        return -10;
+    }
+    struct sigaction old_sa[2], old_alrm, sa;
+    install_segv_guard(&sa, old_sa);
+    install_alrm_guard(&sa, &old_alrm);
+    alarm(15);
+    g_exec_segv = 0;
+    g_exec_timeout = 0;
+    int r = -9;
+    int jv = sigsetjmp(g_exec_jmp, 1);
+    if (jv == 0) {
+        try {
+            /* closure sits at top-1 (luau_load pushed it) */
+            r = ((int (*)(uintptr_t, int, int, int))fn_pcall)(co, 0, -1, 0);
+        } catch (const std::exception& e) {
+            r = -3;
+            LOG_CORE("EXEC: pcall exc: %s", e.what());
+        } catch (...) {
+            r = -3;
+        }
+    }
+    remove_alrm_guard(&old_alrm);
+    remove_segv_guard(&sa, old_sa);
+    if (jv == 2 || g_exec_timeout) return -2;
+    if (jv == 1 || g_exec_segv) return -4;
+    return r;
+}
+
 /* If the slot below top is a string (compile/runtime error object), copy it
  * into out. Returns bytes appended, 0 when not a string. */
 static int extract_top_string(uintptr_t L, char* out, size_t out_len) {
     uintptr_t tp = 0;
-    if (!safe_read(L + 0x58, &tp, 8)) return 0;
+    if (!safe_read(L + LUA_TOP_OFF, &tp, 8)) return 0;   /* 0.741: top @ +0x70 */
     uintptr_t top = unpack_top(tp);
-    uintptr_t slot = top - 0x10;
-    if (slot < 0x100000000ULL || !is_memory_readable(slot)) return 0;
-    uint64_t v = 0;
-    uint32_t t = 0;
-    safe_read(slot, &v, 8);
-    safe_read(slot + 0xc, &t, 4);
-    if (t != 6 || v < 0x100000000ULL || v > 0x16000000000ULL) return 0;
-    uint32_t slen = 0;
-    if (!safe_read(v + 0x14, &slen, 4) || slen == 0 || slen > 600) return 0;
-    char sbuf[608];
-    if (!safe_read(v + 0x18, sbuf, slen)) return 0;
-    sbuf[slen] = 0;
-    return snprintf(out, out_len, "%s", sbuf);
+    for (int k = 1; k <= 8; k++) {
+        uintptr_t slot = top - (uintptr_t)k * 0x10;
+        if (slot < 0x100000000ULL || !is_memory_readable(slot)) return 0;
+        uint64_t v = 0;
+        uint32_t t = 0;
+        safe_read(slot, &v, 8);
+        safe_read(slot + 0xc, &t, 4);
+        if (t != 6 || v < 0x100000000ULL || v > 0x16000000000ULL) continue;
+        uint32_t slen = 0;
+        if (!safe_read(v + 0x14, &slen, 4) || slen == 0 || slen > 600) continue;
+        char sbuf[608];
+        if (!safe_read(v + 0x18, sbuf, slen)) continue;
+        sbuf[slen] = 0;
+        return snprintf(out, out_len, "%s", sbuf);
+    }
+    return 0;
 }
 
 static const char* resume_status_name(int r) {
@@ -2612,6 +3177,7 @@ static const char* resume_status_name(int r) {
         case -2: return "TIMEOUT";
         case -3: return "C++ exception";
         case -4: return "SEGV";
+        case -10: return "unresolved symbol (run __RESOLVE__)";
         default: return "?";
     }
 }
@@ -2633,64 +3199,112 @@ extern "C" int executor_exec_gamestate(const char* code, char* out, size_t out_l
     }
     log_thread_state("CO-FRESH", co);
 
-    /* Direct library pipeline — no permission gates (those live only in the
-     * loadstring wrapper): compile the source with the game's own Luau
-     * compiler, then load the bytecode onto the coroutine, then resume. */
-
-    /* Roblox libc++ std::string (alternate layout, verified from
-     * std::string::__init @0x10000c740): short = data[0x17], size byte at
-     * +0x17; long = {data@0, size@8, cap|1<<63@0x10}, size byte 0x80|len. */
-    uint8_t srcStr[24];
-    memset(srcStr, 0, sizeof(srcStr));
-    size_t slen = strlen(code);
-    char* srcHeap = NULL;
-    if (slen < 0x17) {
-        memcpy(srcStr, code, slen);
-        srcStr[slen] = 0;
-        srcStr[0x17] = (uint8_t)slen;
-    } else {
-        srcHeap = (char*)malloc(slen + 1);
-        if (!srcHeap) {
-            snprintf(out, out_len, "ERR: oom\n");
+    /* Direct pipeline for 0.741.0.7411056 (every address derived from the
+     * real binary, call-chain verified in the loadstring implementation):
+     *   1. src  = std::string __init(code, len)          — 0x10000c75c
+     *   2. cont = compile_entry(sret, src)               — 0x10364fdb4:
+     *      {module0=compile(src)@0, module1=compile("")@8, flag@0x10}
+     *      (rawload reads member1 — the wrong slot; we take member0)
+     *   3. bc   = std::string at *(cont+0)+0x18          — module layout
+     *   4. closure = luau_load(co, "INJ", bc.data, bc.size, 0)
+     *   5. closure fixup: move it to B[0] (stack slot 0) and plant the
+     *      main thread into upvalue 0 (closure+0x30): lua_resume derives
+     *      its `from` via tothread(co, -10003) = upvalue 0 of the func
+     *      at stack slot 0 — without this resume faults on a bare
+     *      lua_newthread coroutine. */
+    uintptr_t fn_rawload = exec_fn_addr(EXEC_FN_RAWLOAD);
+    /* Raw-bytecode mode: a request of the form "BC:<hex>" bypasses the
+     * (dead) compile step entirely — the blob is fed straight to luau_load.
+     * Pair it with chunks pulled out of the module cache and decoded with
+     * __DECODE__. */
+    uint8_t* bc_raw = NULL;
+    size_t bc_raw_len = 0;
+    if (strncmp(code, "BC:", 3) == 0) {
+        const char* hex = code + 3;
+        size_t hl = strlen(hex);
+        while (hl > 0 && (hex[hl-1] == '\n' || hex[hl-1] == '\r' || hex[hl-1] == ' ')) hl--;
+        if (hl >= 2 && (hl & 1) == 0) {
+            bc_raw = (uint8_t*)malloc(hl / 2 ? hl / 2 : 1);
+            if (bc_raw) {
+                for (size_t i = 0; i < hl / 2; i++) {
+                    unsigned v = 0;
+                    if (sscanf(hex + i * 2, "%2x", &v) != 1) {
+                        free(bc_raw);
+                        bc_raw = NULL;
+                        break;
+                    }
+                    bc_raw[i] = (uint8_t)v;
+                }
+                if (bc_raw) bc_raw_len = hl / 2;
+            }
+        }
+        if (!bc_raw) {
+            snprintf(out, out_len, "ERR: bad BC: hex payload\n");
             return -1;
         }
-        memcpy(srcHeap, code, slen);
-        srcHeap[slen] = 0;
-        *(uint64_t*)(srcStr + 0x00) = (uint64_t)srcHeap;
-        *(uint64_t*)(srcStr + 0x08) = slen;
-        *(uint64_t*)(srcStr + 0x10) = (slen + 64) | 0x8000000000000000ULL;
-        srcStr[0x17] = (uint8_t)(0x80 | (slen & 0x7f));
+        LOG_CORE("EXEC: raw bytecode mode: %zu bytes, head=%02x %02x %02x %02x",
+                 bc_raw_len, bc_raw[0], bc_raw[1], bc_raw[2], bc_raw[3]);
+    }
+
+    uintptr_t fn_compile = exec_fn_addr(EXEC_FN_COMPILE);
+    if (!bc_raw && (!fn_rawload || !fn_compile)) {
+        snprintf(out, out_len,
+                 "ERR: execution blocked — %s%s unresolved on client %s "
+                 "(see __RESOLVE__)\n",
+                 fn_rawload ? "" : "rawload ",
+                 fn_compile ? "" : "compile ",
+                 executor_client_version());
+        return -1;
     }
 
     uintptr_t slide = executor_image_slide();
+
+    /* __init(this, ptr, len) and compile_entry(sret, src) — link-time
+     * constants for this build, byte-verified before use. */
+    uintptr_t fn_init = 0x10000c75cULL + slide;
+    uintptr_t fn_ccompile = 0x10364fdb4ULL + slide;
+    if (!bc_raw) {
+        uint32_t first = 0;
+        if (!safe_read(fn_init, &first, 4) || first != 0xa9bc5ff8u ||
+            !safe_read(fn_ccompile, &first, 4) || first != 0xd10103ffu) {
+            snprintf(out, out_len,
+                     "ERR: string/compile signatures drifted — client %s "
+                     "needs re-derivation\n",
+                     executor_client_version());
+            return -1;
+        }
+    }
+
+    uint8_t srcStr[24];
+    memset(srcStr, 0, sizeof(srcStr));
+    size_t slen = bc_raw ? 0 : strlen(code);
+
     int rr = -9;
-    {
-        /* std::string compile(const std::string&) — AAPCS64 sret: result
-         * pointer in x8, source pointer in x0. The result is a CONTAINER:
-         * {refcounted_obj*, std::string bytecode @+8} (verified from the
-         * loader at 0x101533bec which does x0 = arg+8). */
-        uint8_t bcCont[64];
-        memset(bcCont, 0, sizeof(bcCont));
+    uint8_t cont[0x18];                 /* compile_entry sret container */
+    memset(cont, 0, sizeof(cont));
+    if (bc_raw) {
+        rr = 0;                          /* skip compile, load raw below */
+    } else {
         struct sigaction old_sa[2], old_alrm, sa;
         install_segv_guard(&sa, old_sa);
         install_alrm_guard(&sa, &old_alrm);
-        alarm(10);
+        alarm(20);
         g_exec_segv = 0;
         g_exec_timeout = 0;
         int jv = sigsetjmp(g_exec_jmp, 1);
-        LOG_CORE("EXEC: compile stage jv=%d rr=%d", jv, rr);
+        LOG_CORE("EXEC: init+compile stage jv=%d", jv);
         if (jv == 0) {
             try {
+                ((void (*)(void*, const char*, size_t))fn_init)(srcStr, code, slen);
 #if defined(__aarch64__)
-                uintptr_t fn = 0x103da7de0ULL + slide;
                 __asm__ volatile(
                     "mov x8, %[dst]\n"
                     "mov x0, %[srcp]\n"
                     "blr %[f]\n"
                     :
-                    : [dst] "r" ((uintptr_t)bcCont),
+                    : [dst] "r" ((uintptr_t)cont),
                       [srcp] "r" ((uintptr_t)srcStr),
-                      [f] "r" (fn)
+                      [f] "r" (fn_ccompile)
                     : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8",
                       "x9", "x10", "x11", "x12", "x13", "x14", "x18",
                       "memory", "cc");
@@ -2700,63 +3314,134 @@ extern "C" int executor_exec_gamestate(const char* code, char* out, size_t out_l
 #endif
             } catch (...) {
                 rr = -5;
-                LOG_CORE("EXEC: compile exc");
+                LOG_CORE("EXEC: init+compile exc");
             }
         } else {
             rr = -4;
         }
-        LOG_CORE("EXEC: compile done rr=%d flag=%#x", rr, bcCont[8 + 0x17]);
-        remove_alrm_guard(&old_alrm);
-        remove_segv_guard(&sa, old_sa);
-
+        LOG_CORE("EXEC: compile done rr=%d cont={%#llx,%#llx,%#llx}",
+                 rr,
+                 rr ? 0ull : (unsigned long long)*(uintptr_t*)cont,
+                 rr ? 0ull : (unsigned long long)*(uintptr_t*)(cont + 8),
+                 (unsigned long long)*(uintptr_t*)(cont + 0x10));
         if (rr == 0) {
-            /* The result is an opaque refcounted container; the loader
-             * (0x101533bec) resolves the bytecode from it itself (it calls
-             * the string resolver 0x102991a18 on arg+8) — pass it whole,
-             * exactly like the loadstring wrapper does. */
-            LOG_CORE("EXEC: compile container obj=%p", *(void**)bcCont);
-            {
-                /* container + result-object dump for offline analysis */
-                uint64_t cd[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-                memcpy(cd, bcCont, sizeof(cd));
-                uintptr_t cobj = *(uintptr_t*)bcCont;
-                uint64_t od[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-                if (cobj >= 0x100000000ULL && cobj < 0x16000000000ULL)
-                    safe_read(cobj, od, sizeof(od));
-                LOG_CORE("EXEC: cont=%016llx %016llx %016llx %016llx obj8=%016llx %016llx %016llx %016llx",
-                         (unsigned long long)cd[0], (unsigned long long)cd[1],
-                         (unsigned long long)cd[2], (unsigned long long)cd[3],
-                         (unsigned long long)od[0], (unsigned long long)od[1],
-                         (unsigned long long)od[2], (unsigned long long)od[3]);
-            }
-            {
-                /* int loader(L, const container* bc, const char* chunkname,
-                 *            int, int) — pushes the closure, 0 on success. */
-                struct sigaction osa2[2], oalrm2, sa2;
-                install_segv_guard(&sa2, osa2);
-                install_alrm_guard(&sa2, &oalrm2);
-                alarm(10);
-                g_exec_segv = 0;
-                g_exec_timeout = 0;
-                int jv2 = sigsetjmp(g_exec_jmp, 1);
-                if (jv2 == 0) {
-                    try {
-                        rr = ((int(*)(uintptr_t, const void*, const char*, int, int))
-                              (0x101533becULL + slide))(co, bcCont, "INJ", 0, 0);
-                    } catch (...) {
-                        rr = -5;
-                    }
-                } else {
-                    rr = -4;
-                }
-                remove_alrm_guard(&oalrm2);
-                remove_segv_guard(&sa2, osa2);
-                LOG_CORE("EXEC: loader -> %d (segv=%d to=%d)", rr,
-                         (int)g_exec_segv, (int)g_exec_timeout);
+            /* diagnostics: the module-cache manager singleton + both
+             * member targets, 0x30 bytes each */
+            uintptr_t mgr = 0;
+            if (safe_read(0x106c4d4f0ULL + slide, &mgr, 8))
+                LOG_CORE("EXEC: module mgr @%#llx",
+                         (unsigned long long)mgr);
+            for (int m = 0; m < 2; m++) {
+                uintptr_t mp = *(uintptr_t*)(cont + m * 8) & PTR_MASK;
+                if (mp < 0x100000000ULL || mp > 0x16000000000ULL) continue;
+                uint8_t mb[0x30];
+                if (!safe_read(mp, mb, sizeof(mb))) continue;
+                LOG_CORE("EXEC: member%d %p:", m, (void*)mp);
+                for (int d = 0; d < 0x30; d += 8)
+                    LOG_CORE("  +%02x: %016llx", d,
+                             (unsigned long long)*(uint64_t*)(mb + d));
             }
         }
+        remove_alrm_guard(&old_alrm);
+        remove_segv_guard(&sa, old_sa);
     }
-    if (srcHeap) free(srcHeap);
+
+    /* release the source string if __init allocated a long buffer;
+     * the compiled module is cache-owned — never freed here */
+    if ((srcStr[0x17] & 0x80) && *(void**)srcStr) free(*(void**)srcStr);
+
+    /* extract the bytecode (data, size) from member0's module string */
+    const char* bc_data = NULL;
+    size_t bc_len = 0;
+    if (bc_raw) {
+        bc_data = (const char*)bc_raw;
+        bc_len = bc_raw_len;
+    } else if (rr == 0) {
+        uintptr_t module = *(uintptr_t*)cont & PTR_MASK;
+        if (module < 0x100000000ULL || module > 0x16000000000ULL) {
+            n += snprintf(out + n, out_len - n,
+                          "ERR: compile container has no module0 (%#llx)\n",
+                          (unsigned long long)*(uintptr_t*)cont);
+            return -1;
+        }
+        uint8_t mod[0x48];
+        if (!safe_read(module, mod, sizeof(mod))) {
+            n += snprintf(out + n, out_len - n,
+                          "ERR: module unreadable @%p\n", (void*)module);
+            return -1;
+        }
+        LOG_CORE("EXEC: module0 dump %p:", (void*)module);
+        for (int d = 0; d < 0x48; d += 8)
+            LOG_CORE("  +%02x: %016llx", d,
+                     (unsigned long long)*(uint64_t*)(mod + d));
+        const uint8_t* bcs = mod + 0x18;          /* module string @ +0x18 */
+        if (bcs[0x17] & 0x80) {                   /* long form */
+            bc_data = *(const char**)(mod + 0x18);
+            bc_len = *(size_t*)(mod + 0x20);
+        } else {                                   /* short: inline */
+            bc_data = (const char*)(mod + 0x18);
+            bc_len = bcs[0x17];
+        }
+        /* the data pointer must be a plain, readable heap pointer — PAC
+         * signed or chained pointers here mean the layout guess is wrong */
+        if (bc_data && (bc_data < (const char*)0x100000000ULL ||
+                        bc_data > (const char*)0x16000000000ULL)) {
+            n += snprintf(out + n, out_len - n,
+                          "ERR: module string data ptr invalid (%#llx, "
+                          "size=%#zx sizebyte=%#x) — layout needs rework\n",
+                          (unsigned long long)(uintptr_t)bc_data, bc_len,
+                          bcs[0x17]);
+            LOG_CORE("EXEC: bad bc_data=%#llx len=%#zx — aborting safely",
+                     (unsigned long long)(uintptr_t)bc_data, bc_len);
+            return -1;
+        }
+        if (!bc_data || bc_len == 0 || bc_len > 0x400000ULL) {
+            n += snprintf(out + n, out_len - n,
+                          "ERR: compiler returned empty/oversize bytecode "
+                          "(sizebyte=%#x mod0=%p mod1=%p)\n",
+                          bcs[0x17], (void*)*(uintptr_t*)cont,
+                          (void*)*(uintptr_t*)(cont + 8));
+            return -1;
+        }
+        LOG_CORE("EXEC: bytecode %zu bytes @ %p head=%02x %02x %02x %02x",
+                 bc_len, (void*)bc_data,
+                 bc_len > 0 ? (uint8_t)bc_data[0] : 0,
+                 bc_len > 1 ? (uint8_t)bc_data[1] : 0,
+                 bc_len > 2 ? (uint8_t)bc_data[2] : 0,
+                 bc_len > 3 ? (uint8_t)bc_data[3] : 0);
+        /* dead-compiler detector: module string == source passthrough */
+        if (bc_len == slen && bc_data != code && memcmp(bc_data, code, slen) == 0) {
+            n += snprintf(out + n, out_len - n,
+                          "ERR: compiler is dead on this build — module "
+                          "string equals the source (passthrough)\n");
+            return -1;
+        }
+    }
+
+    if (rr == 0) {
+        struct sigaction osa2[2], oalrm2, sa2;
+        install_segv_guard(&sa2, osa2);
+        install_alrm_guard(&sa2, &oalrm2);
+        alarm(15);
+        g_exec_segv = 0;
+        g_exec_timeout = 0;
+        int jv2 = sigsetjmp(g_exec_jmp, 1);
+        if (jv2 == 0) {
+            try {
+                rr = ((int (*)(uintptr_t, const char*, const char*, size_t, int))
+                      exec_fn_addr(EXEC_FN_BUfload))(co, "INJ", bc_data, bc_len, 0);
+            } catch (...) {
+                rr = -5;
+            }
+        } else {
+            rr = -4;
+        }
+        remove_alrm_guard(&oalrm2);
+        remove_segv_guard(&sa2, osa2);
+        LOG_CORE("EXEC: luau_load -> %d (segv=%d to=%d)", rr,
+                 (int)g_exec_segv, (int)g_exec_timeout);
+    }
+
     if (rr != 0) {
         char eb[608];
         int got = extract_top_string(co, eb, sizeof(eb));
@@ -2768,9 +3453,14 @@ extern "C" int executor_exec_gamestate(const char* code, char* out, size_t out_l
     }
     log_thread_state("CO-LOADED", co);
 
-    /* closure must sit at top-16 with tt==8 (function) */
+    /* ---- run: lua_pcall executes the closure synchronously (0.741's
+     * lua_resume only moves values — the scheduler runs game coroutines,
+     * and ours are not registered with it). The closure stays where
+     * luau_load pushed it: at top-1. ---- */
+    uintptr_t co_stack = 0;
+    safe_read(co + LUA_STACK_OFF, &co_stack, 8);
     uintptr_t tp = 0;
-    safe_read(co + 0x58, &tp, 8);
+    safe_read(co + LUA_TOP_OFF, &tp, 8);
     uintptr_t top = unpack_top(tp);
     uint64_t fv = 0;
     uint32_t ft = 0;
@@ -2778,14 +3468,16 @@ extern "C" int executor_exec_gamestate(const char* code, char* out, size_t out_l
         safe_read(top - 0x10, &fv, 8);
         safe_read(top - 0x10 + 0xc, &ft, 4);
     }
-    LOG_CORE("EXEC: closure at top-1: val=%#llx tt=%u",
-             (unsigned long long)fv, ft);
+    LOG_CORE("EXEC: closure at top-1: val=%#llx tt=%u (top=%#llx stack=%#llx)",
+             (unsigned long long)fv, ft,
+             (unsigned long long)top, (unsigned long long)co_stack);
     if (ft != 8) {
         n += snprintf(out + n, out_len - n,
                       "ERR: no closure on co top (val=%#llx tt=%u)\n",
                       (unsigned long long)fv, ft);
         return -1;
     }
+
     if (fv >= 0x100000000ULL && fv < 0x16000000000ULL) {
         uint64_t c[6] = {0, 0, 0, 0, 0, 0};
         safe_read(fv, c, sizeof(c));
@@ -2796,18 +3488,32 @@ extern "C" int executor_exec_gamestate(const char* code, char* out, size_t out_l
                  (unsigned long long)c[5]);
     }
 
-    int r = exec_resume(co, L);
-    LOG_CORE("EXEC: resume(co=%p, from=%p) -> %d (%s)", (void*)co, (void*)L,
-             r, resume_status_name(r));
+    int r = exec_run(co);
+    LOG_CORE("EXEC: run(co=%p) -> %d", (void*)co, r);
     log_thread_state("CO-AFTER", co);
+    /* dump the top stack slots raw — the error object hunting ground */
+    {
+        uintptr_t tp2 = 0;
+        safe_read(co + LUA_TOP_OFF, &tp2, 8);
+        uintptr_t top2 = unpack_top(tp2);
+        for (int k = 1; k <= 10; k++) {
+            uintptr_t slot = top2 - (uintptr_t)k * 0x10;
+            if (slot < 0x100000000ULL || !is_memory_readable(slot)) break;
+            uint64_t v = 0;
+            uint32_t t = 0;
+            safe_read(slot, &v, 8);
+            safe_read(slot + 0xc, &t, 4);
+            LOG_CORE("EXEC: slot[-%d] = %#llx tt=%u", k,
+                     (unsigned long long)v, t);
+        }
+    }
 
     /* results of the chunk sit below co's top (ok flag, error object) */
     {
         char rb[608];
         int got = extract_top_string(co, rb, sizeof(rb));
-        n += snprintf(out + n, out_len - n, "resume=%d (%s)", r,
-                      resume_status_name(r));
-        if (got > 0) n += snprintf(out + n, out_len - n, " err=\"%s\"", rb);
+        n += snprintf(out + n, out_len - n, "pcall=%d", r);
+        if (got > 0) n += snprintf(out + n, out_len - n, " err/result=\"%s\"", rb);
         n += snprintf(out + n, out_len - n, "\n");
     }
     return r;
@@ -2830,13 +3536,22 @@ extern "C" int executor_diag(char* buf, size_t len) {
  * own lua_resume call (lldb one-shot): derive its G, store G->mainthread. */
 extern "C" int executor_set_main(uintptr_t thread_L, char* buf, size_t len) {
     uintptr_t G = 0;
-    if (!safe_read(thread_L + 0x30, &G, 8) ||
+    if (!safe_read(thread_L + LUA_G_OFF, &G, 8) ||
         G < 0x100000000ULL || G > 0x16000000000ULL || (G & 0xF) != 0) {
         snprintf(buf, len, "ERR: %#lx has no sane G", (unsigned long)thread_L);
         return -1;
     }
     uintptr_t mt = 0;
-    safe_read(G + 0x88, &mt, 8);
+    {
+        /* the mainthread slot moved across versions — find the backref */
+        uint8_t gbuf[0x2c0];
+        if (safe_read(G, gbuf, sizeof(gbuf))) {
+            for (int off = 0x20; off + 8 <= (int)sizeof(gbuf) && !mt; off += 8) {
+                uintptr_t cand = *(uintptr_t*)(gbuf + off);
+                if (validate_main_thread(cand)) mt = cand;
+            }
+        }
+    }
     if (!validate_main_thread(mt)) {
         snprintf(buf, len, "ERR: G=%p mainthread %#lx invalid", (void*)G,
                  (unsigned long)mt);
@@ -2866,9 +3581,107 @@ static void* main_watchdog_thread(void* arg) {
     return NULL;
 }
 
-/* Hunt the game main thread through ScriptContext instances: RTTI vtable
- * scan (proven), then a bounded pointer-BFS over each instance looking for
- * lua_State-shaped objects (lua_state_usable), then G->mainthread. */
+/* __DECODE__ <hex module-string-struct addr>: run the client's own chunk
+ * decoder (0x101448b48 on 0.741: decoder(sret-string, in-string)) on a live
+ * module string and hex-dump the result. The module cache holds the game's
+ * magic-wrapped (0xE009325B4A107A52...) server chunks — this reveals the
+ * inner format without any guessing. */
+extern "C" int executor_decode_chunk(uintptr_t str_addr, char* buf, size_t len) {
+    int n = 0;
+    uintptr_t slide = executor_image_slide();
+    uintptr_t fn = 0x101448b48ULL + slide;
+    uint32_t first = 0;
+    if (!safe_read(fn, &first, 4) || first != 0xd10203ffu) {
+        snprintf(buf, len, "ERR: decoder signature drifted (%#x) on %s\n",
+                 first, executor_client_version());
+        return -1;
+    }
+    if (str_addr < 0x100000000ULL || str_addr > 0x16000000000ULL) {
+        snprintf(buf, len, "ERR: bad string addr\n");
+        return -1;
+    }
+    uint8_t in[24];
+    if (!safe_read(str_addr, in, sizeof(in))) {
+        snprintf(buf, len, "ERR: string unreadable\n");
+        return -1;
+    }
+    uint8_t out[24];
+    memset(out, 0, sizeof(out));
+    int rc = 0;
+    {
+        struct sigaction osa[2], oalrm, sa;
+        install_segv_guard(&sa, osa);
+        install_alrm_guard(&sa, &oalrm);
+        alarm(15);
+        g_exec_segv = 0;
+        g_exec_timeout = 0;
+        int jv = sigsetjmp(g_exec_jmp, 1);
+        if (jv == 0) {
+            try {
+#if defined(__aarch64__)
+                __asm__ volatile(
+                    "mov x8, %[dst]\n"
+                    "mov x0, %[srcp]\n"
+                    "blr %[f]\n"
+                    :
+                    : [dst] "r" ((uintptr_t)out),
+                      [srcp] "r" ((uintptr_t)str_addr),
+                      [f] "r" (fn)
+                    : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8",
+                      "x9", "x10", "x11", "x12", "x13", "x14", "x18",
+                      "memory", "cc");
+                rc = 0;
+#else
+                rc = -7;
+#endif
+            } catch (...) {
+                rc = -5;
+            }
+        } else {
+            rc = -4;
+        }
+        remove_alrm_guard(&oalrm);
+        remove_segv_guard(&sa, osa);
+    }
+    n += snprintf(buf + n, len - n, "decode rc=%d segv=%d\n", rc, (int)g_exec_segv);
+    if (rc != 0) return -1;
+    /* result string: classic layout */
+    const char* data = NULL;
+    size_t dlen = 0;
+    if (out[0x17] & 0x80) {
+        data = *(const char**)out;
+        dlen = *(size_t*)(out + 8);
+    } else {
+        data = (const char*)out;
+        dlen = out[0x17];
+    }
+    n += snprintf(buf + n, len - n, "out: len=%#zx data=%p sizebyte=%#x\n",
+                  dlen, (void*)(uintptr_t)data, out[0x17]);
+    if (!data || dlen == 0 || dlen > 0x10000) return 0;
+    uint8_t db[1024];
+    size_t take = dlen < sizeof(db) ? dlen : sizeof(db);
+    if (!safe_read((uintptr_t)data, db, take)) {
+        n += snprintf(buf + n, len - n, "out data unreadable\n");
+        return 0;
+    }
+    for (size_t i = 0; i < take && n < (int)len - 24; i += 8) {
+        uint64_t v = 0;
+        size_t k = take - i < 8 ? take - i : 8;
+        memcpy(&v, db + i, k);
+        n += snprintf(buf + n, len - n, "+%04zx: %016llx\n", i,
+                      (unsigned long long)v);
+    }
+    /* printable prefix */
+    n += snprintf(buf + n, len - n, "ascii: ");
+    for (size_t i = 0; i < take && n < (int)len - 8; i++) {
+        uint8_t c = db[i];
+        buf[n++] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+    }
+    buf[n++] = '\n';
+    return n;
+}
+
+
 extern "C" int executor_find_main_sc(char* buf, size_t len) {
     int n = 0;
     if (!g_vtable_data) {
@@ -2896,9 +3709,9 @@ extern "C" int executor_find_main_sc(char* buf, size_t len) {
                     }
                     if (lua_state_usable(cand)) {
                         uintptr_t G = 0, mt = 0;
-                        safe_read(cand + 0x30, &G, 8);
+                        safe_read(cand + 0x48, &G, 8);
                         if (G < 0x100000000ULL || G > 0x16000000000ULL) continue;
-                        safe_read(G + 0x88, &mt, 8);
+                        safe_read(G + 0x90, &mt, 8);
                         if (!validate_main_thread(mt)) continue;
                         g_main_L = mt;
                         g_main_G = G;
@@ -2969,9 +3782,22 @@ extern "C" int executor_findptr(uint64_t value, char* buf, size_t len) {
 
 extern "C" int executor_exec_bc(const uint8_t* bc, size_t nbc, char* out, size_t out_len) {
     uintptr_t slide = executor_image_slide();
-    uintptr_t fn_bufload = 0x102c5b648ULL + slide;   /* (L, chunkname, bc, bclen, env) */
-    uintptr_t fn_pcall = 0x102c3b1ccULL + slide;
+    uintptr_t fn_bufload = exec_fn_addr(EXEC_FN_BUfload);    /* (L, chunkname, bc, bclen, env) */
+    uintptr_t fn_pcall = exec_fn_addr(EXEC_FN_PCALL);
+    uintptr_t fn_newthread_rt = exec_fn_addr(EXEC_FN_NEWTHREAD);
+    uintptr_t fn_resume_rt = exec_fn_addr(EXEC_FN_RESUME);
     int n = 0;
+
+    if (!fn_bufload || !fn_newthread_rt || !fn_resume_rt) {
+        snprintf(out, out_len,
+                 "ERR: execution blocked — unresolved on client %s: %s%s%s "
+                 "(see __RESOLVE__; stale constants are never substituted)\n",
+                 executor_client_version(),
+                 fn_bufload ? "" : "luau_load ",
+                 fn_newthread_rt ? "" : "lua_newthread ",
+                 fn_resume_rt ? "" : "lua_resume ");
+        return -1;
+    }
 
     find_live_thread();
     if (g_live_n == 0) {
@@ -3003,10 +3829,10 @@ extern "C" int executor_exec_bc(const uint8_t* bc, size_t nbc, char* out, size_t
         uintptr_t glue = 0;
         safe_read(L + 0x78, &glue, 8);
         uintptr_t Lg = 0;
-        safe_read(L + 0x30, &Lg, 8);
+        safe_read(L + 0x48, &Lg, 8);
         uintptr_t mt = 0;
         if (Lg >= 0x100000000ULL && Lg <= 0x16000000000ULL)
-            safe_read(Lg + 0x88, &mt, 8);
+            safe_read(Lg + 0x90, &mt, 8);
         if (mt != L || glue < 0x100000000ULL || glue > 0x16000000000ULL) {
             LOG_CORE("EXECBC: SKIP L=%p glue=%#llx mt=%#llx", (void*)L,
                      (unsigned long long)glue, (unsigned long long)mt);
@@ -3032,10 +3858,10 @@ extern "C" int executor_exec_bc(const uint8_t* bc, size_t nbc, char* out, size_t
             /* Execute via a fresh coroutine + lua_resume (the native path
              * Roblox itself uses): their luaD_call defers direct calls to
              * the scheduler (-1), but resuming a fresh coroutine runs it */
-            uintptr_t fn_newthread = 0x102c529f0ULL + slide;
+            uintptr_t fn_newthread = fn_newthread_rt;
             uintptr_t fn_bufload2 = fn_bufload;
             /* real lua_resume(co, from, nargs): runs closure already on co's stack */
-            uintptr_t fn_resume = 0x102c48ab0ULL + slide;
+            uintptr_t fn_resume = fn_resume_rt;
 
             /* CRITICAL: a parked main thread can have top BELOW stack.
              * lua_newthread pushes a TValue at main->top — normalize first,

@@ -66,6 +66,19 @@ int executor_exec_gamestate(const char* code, char* out, size_t out_len);
 /* Diagnostics: main-thread cache validity + live snapshot (__DIAG__). */
 int executor_diag(char* buf, size_t len);
 
+/* Version-agnostic symbol resolution (__RESOLVE__): reports the client
+ * version + image UUID, every symbol found through string anchors, and which
+ * exec-pipeline symbols are usable. Link-time constants are only ever used
+ * when the running client is the exact build they were captured from. */
+int executor_resolve(char* buf, size_t len);
+
+/* Running client's CFBundleVersion, or "unknown". */
+const char* executor_client_version(void);
+
+/* __DECODE__ <hex module-string addr>: run the client's chunk decoder on a
+ * live magic-wrapped server chunk and hex-dump the inner format. */
+int executor_decode_chunk(uintptr_t str_addr, char* buf, size_t len);
+
 #ifdef __cplusplus
 }
 #endif

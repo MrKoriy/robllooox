@@ -11,6 +11,7 @@
  * Control commands (exact match):
  *   __PING__  -> "PONG ..."          (health check, no Lua needed)
  *   __RESET__ -> recreate Lua state  ("OK: Lua state reset")
+ *   __RESOLVE__ -> client version + anchor-based symbol resolution report
  */
 
 #include <stdio.h>
@@ -292,15 +293,29 @@ static lua_State *get_lua_state(void) {
 /* Lua execution with output capture                                   */
 /* ------------------------------------------------------------------ */
 
+static int host_is_roblox(void) {
+    const char *p = getprogname();
+    return p && strcasestr(p, "Roblox");
+}
+
 static char *execute_lua_code(const char *code) {
     strbuf sb;
     sb_init(&sb);
 
-    if (executor_is_ready()) {
+    /* In the Roblox host, route everything through the game-state
+     * executor: it discovers the game VM's main thread on demand, so no
+     * separate capture step is required. Standalone Lua stays the
+     * fallback for non-Roblox hosts and a cold pipeline. */
+    if (host_is_roblox()) {
         char exec_resp[4096] = {0};
-        executor_execute(code, exec_resp, sizeof(exec_resp));
-        sb_append(&sb, exec_resp);
-        return sb.data;
+        extern int executor_exec_gamestate(const char*, char*, size_t);
+        executor_exec_gamestate(code, exec_resp, sizeof(exec_resp));
+        if (strncmp(exec_resp, "main L=", 7) == 0) {
+            sb_append(&sb, exec_resp);
+            return sb.data;
+        }
+        log_msg("gamestate pipeline unavailable (%.80s) — standalone fallback",
+                exec_resp);
     }
 
     if (!get_lua_state()) {
@@ -481,6 +496,13 @@ static char *handle_control_command(const char *msg) {
         executor_exec_gamestate(code, out, 8192);
         return out;
     }
+    if (n >= 11 && strncmp(msg, "__RESOLVE__", 11) == 0) {
+        char* out = malloc(16384);
+        if (!out) return strdup("ERR: oom");
+        extern int executor_resolve(char*, size_t);
+        executor_resolve(out, 16384);
+        return out;
+    }
     if (n >= 7 && strncmp(msg, "__DIAG__", 8) == 0) {
         char* out = malloc(2048);
         if (!out) return strdup("ERR: oom");
@@ -502,6 +524,16 @@ static char *handle_control_command(const char *msg) {
         extern int executor_set_main(unsigned long, char*, size_t);
         executor_set_main((unsigned long)thr, rbuf, sizeof(rbuf));
         return strdup(rbuf);
+    }
+    if (n >= 10 && strncmp(msg, "__DECODE__", 10) == 0) {
+        unsigned long long saddr = 0;
+        if (sscanf(msg + 10, " %llx", &saddr) != 1)
+            return strdup("ERR: usage __DECODE__ <hex module-string addr>");
+        char* out = malloc(16384);
+        if (!out) return strdup("ERR: oom");
+        extern int executor_decode_chunk(uintptr_t, char*, size_t);
+        executor_decode_chunk((uintptr_t)saddr, out, 16384);
+        return out;
     }
     if (n >= 10 && strncmp(msg, "__FINDPTR__", 11) == 0) {
         unsigned long long value = 0;

@@ -34,3 +34,6 @@ ui/logs/
 .vscode/
 *.swp
 *.swo
+
+# Host-side build artifacts for the resolver self-test
+resolver_selftest

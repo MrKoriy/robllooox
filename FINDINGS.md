@@ -1,5 +1,116 @@
 # FINDINGS — Stage 2 progress (verified against Roblox 0.732.0.7321040, macOS arm64e)
 
+# СЕССИЯ 2026-10-03 (клиент 0.741.0.7411056): КОНЕЙЕР ИСПОЛНЕНИЯ ЗАРАБОТАЛ
+# (luau_load + resume = OK на живом чанке), формат чанков вскрыт
+
+## Главные результаты (всё проверено живьём, процесс 68378/последующие)
+
+1. **Полная адаптация к 0.741 + КОНЕЧНЫЙ ПРОГОН**: декодированный серверный
+   чанк (1322 байта) загружен через наш luau_load → closure fixup →
+   lua_resume → **resume=0 (OK)**. Скрипт игры ВЫПОЛНИЛСЯ через наш конвейер.
+
+2. **Инжект**: lldb-путь (live_inject.sh) работает; DYLD_INSERT на этом
+   билде НЕ грузится (проверено и через open --env, и напрямую) — только
+   lldb dlopen. Ресайн tools/resign_adhoc.sh (бэкап ~/roblox_backups/
+   RobloxPlayer.orig-741) обязателен.
+
+3. **Layout lua_State 0.741** (выведен из luaE_newthread 0x1026f3494,
+   stack_init 0x1026f3570, lua_newthread 0x1026d6f1c, tothread
+   0x1026d8544, index2adr 0x1026dc1d4, lua_resume 0x1026e5a54):
+   - API-объект = 0x88-байтовый GC-wrapper: **tt@+1 (0xA), status@+3,
+     base@+0x60, G@+0x68, top@+0x70, value-stack@+0x78, last@+0x80**.
+   - TValue: {value@0, tt(u32)@0xc}, 0x10 — не изменился.
+   - Анти-подделка: u32 на +0x18 = low32(адрес поля)^0x2d (stack_init).
+   - Свежий поток: top=base=stack+0x10, last=stack+0x280, [+0x50]==[+0x58]
+     (inner), +0x1c(u32)==8. Phase A/B сканер переписан под это.
+   - Псевдоиндексы: registry=-10000 → G+0x620 (TValue), globals=-10002 →
+     [L+0x40], environ=-10001, **upvalueindex(i) = -10003-i, слот
+     upvalue i = closure+0x30+i*0x10, nupvals = байт closure+4**.
+
+4. **lua_resume(co, from, nargs)**: arg0 = короутина (значения копируются
+   НА её стек, x19); `from` НЕ читается из arg1 — Roblox выводит его сам:
+   **tothread(co, -10003) = upvalue-0 замыкания на стеке слота B[0]**.
+   Голый luau_load-клоужер имеет nup=0 → tothread=NULL → deref [0x3] →
+   SEGV (поймано живьём, crash at 0x3). ЛЕКАРСТВО (в коде): перенести
+   closure TValue в B[0] (top сбросить на B+0x10) + bump nupvals 0→1 +
+   записать {main-thread, tt=0xA} в closure+0x30. После этого resume=0.
+
+5. **«compile» клиента НЕ компилирует**: 0x10364fdb4 (BL перед rawload в
+   loadstring-обёртке) = контейнер-кэш {member0=cache(src)@0,
+   member1=cache("")@8}. Резолвер выводит его как «compile» — это
+   кэш-обёртка, НЕ компилятор. Модуль: {u32@0, u32@4, hash, hash,
+   string@+0x18 (классический libc++), count@+0x30, refcount@+0x38,
+   {magic 0xF1F1F1F1, checksum}@+0x40}. loadstring на 0.741 — мёртвый
+   код (rawload читает member1 = пустышку). Внутри игры тоже проверено:
+   module string == источник (passthrough). Клиент НИКОГДА не компилирует
+   исходники: «Bytecode compilation: N compiled» (PreloadedRbxmSerializer)
+   НЕ сработал при джойне place 1818.
+
+6. **Кэш чанков = библиотека реального байткода**: менеджер-синглтон
+   [0x106c4d4f0+slide] → {array@+8, size@+0x10 (u32), capacity@+0x18
+   (0x8000)} — ПЛОСКИЙ массив указателей на модули (пустые слоты =
+   0xfffffffffffff000). При джойне 0x53ea≈21450 записей! Модульные строки
+   = серверные чанки в magic-обёртке: **первый qword = 0xE009325B4A107A52**.
+
+7. **__DECODE__ (новая IPC-команда)**: клиентский декодер 0x101448b48
+   (sret-string, in-string) вызывается напрямую на module+0x18 — возвращает
+   внутренний формат. Проверено: 0x52a-байтовый blob, loadable+runnable.
+
+8. **BC:<hex> (новый режим executor_exec_gamestate)**: сырой blob идёт
+   прямо в luau_load, минуя «компиляцию». ЭТО ТЕСТБЕНЧ БАЙТКОДА.
+
+9. **Целостность чанков**: мутация «isDisabled»→«isDisabXed» (середина
+   строки-константы) → чанк ГРУЗИТСЯ И РАБОТАЕТ (resume=0). Мутация
+   первого символа первой строки и бита в хвосте → «bytecode corrupted».
+   Формат: строки-константы СВОБОДНЫ для патча (constant-patching жив!),
+   инструкции/хвост защищены хешем. Хеш-функция 0x102e72de4 = Murmur-стиль
+   (константы 0x9e3779b1/0x85ebca77/0x165667b1/0x61c8864f...) —
+   ДЕТЕРМИНИРОВАННАЯ, без секрета → пересчитывается подделкой.
+
+10. **Настоящий парсер чанков**: luau_load → protected call → parser
+    0x1026fdeec → **0x10144aa5c(chunkname, data, size, env)** (ScriptContext
+    регион). Внутри: FFlag-таблицы 0x105a2f744/74e/758, хеш-гейты
+    (телеметрия?), 0x10144afe4 → 0x10144b7ec — цепочка разбора формата.
+    Первый байт валидного чанка = 0x09 (версия формата?).
+
+## Команды воспроизведения сессии
+```bash
+make && tools/resign_adhoc.sh          # сборка + adhoc
+# запуск (DYLD не работает на 0.741 — только lldb):
+DYLD_INSERT_LIBRARIES=... nohup .../RobloxPlayer &   # просто запустить GUI
+./live_inject.sh                        # lldb dlopen payload
+open "roblox://experiences/start?placeId=1818"   # джойн (в инжекнутом процессе)
+# сокет: /tmp/inj_ipc_501.sock
+printf '__RESOLVE__' | nc -U /tmp/inj_ipc_501.sock
+# чанк из кэша: mgr=[0x106c4d4f0+slide] (slide из __DIAG__),
+# массив [mgr+8], модули — указатели; __DECODE__ <module+0x18>
+printf '__DECODE__ 115b8f778' | nc -U /tmp/inj_ipc_501.sock
+# исполнение сырого байткода:
+echo "BC:<hex>" | nc -U /tmp/inj_ipc_501.sock
+```
+
+## Что осталось до fly.lua (чётко очерчено)
+1. **Формат чанка**: дочитать парсер 0x10144aa5c/0x10144afe4/0x10144b7ec —
+   порядок полей (header 09 03 1a 09; строковая таблица [len][str];
+   протос; инструкции; хвост-хеш). Проверить: первый entry таблицы =
+   chunkname (мутация первого символа падает).
+2. **Хеш-хвост**: реверс 0x102e72de4 (какие байты хешируются, seed,
+   где лежит ожидаемое значение) → пересчёт для своих чанков.
+3. **Карта опкодов 0.741**: из декодированных чанков + известных исходников
+   (короткие UI-скрипты с "IsSubmenu"-структурами) + тестбенч BC:.
+   21495 образцов в кэше — материала достаточно.
+4. **Ассемблер/компилятор**: либо мини-компилятор нашего Luau → формат
+   0.741 (перенос rbxRemapOp-подхода 0.735), либо темплейт-сборка
+   (взять чанк-скелет, заменить строковую таблицу+инструкции).
+5. Прогнать fly.lua: compile → (хеш) → BC: → resume. Механика resume ГОТОВА.
+
+## Инструменты сессии
+- __DECODE__ — вызов клиентского декодера на module-строке из кэша.
+- BC:<hex> — raw-bytecode режим executor_exec_gamestate.
+- Полный дизассембл 0.741: /tmp/rbx741_disasm.txt (851МБ, no-raw-insn).
+- resign_adhoc.sh: BACKUP=RobloxPlayer.orig-741.
+
+
 ## СЕССИЯ 2026-08-22 (версия клиента 0.735.0.7351131, arm64, всё ниже —
 ## верифицировано дизассемблом и/или на живом процессе)
 
@@ -462,3 +573,138 @@ NULL-объекте.
 - /tmp/cap_cb.py — рабочий python-callback для lldb bp (тихой фильтрацией!)
 - /tmp/min42_hex.txt — минимальный тест `return 42`
 - executor_core.cpp: телеметрия SIGSEGV(x8/x25/x26/x27), DUMP/STUB секции
+
+# Сессия 2026-09-22: клиент 0.739.0.7394500 — резолвер закрыт полностью (офлайн)
+
+## Что сделано (всё верифицировано дизассемблом, офлайн — Hyperion ещё не снят)
+
+## Резолвер: 8/8 символов (5 якорных + 3 деривационных), selftest PASS
+
+Якорные (строковые):
+- lua_resume       0x10295be9c  «cannot resume %s coroutine» (AMBIGUOUS, см. split)
+- luaD_growstack   0x102950e7c  «stack overflow» (17 fns, verified=0 — кандидат)
+- luaG_runerror    0x10295d700  verified=2
+- luaL_argerror    0x1029528b4  НОВЫЙ якорь «invalid argument #%d (%s expected, got %s)» —
+                                 старый «bad argument #%d to '%s'» в 0.739 не материализуется
+- luau_load        0x102973e68  verified=2 (обе mismatch-строки undump + «bytecode corrupted»)
+
+Деривационные (без строк, граф/данные):
+- lua_newthread    0x10294d4c8  три гейта: isyieldable-slot-арифметика → create из пар
+  luaL_Reg, {"create",fn}-корроборация, BL-цель create с MOVZ #0xA (LUA_TTHREAD|bit5)
+  в теле. ВАЖНО: тег 8 у фабрики 0x102952e6c — ложный след (generic tagged-фабрика,
+  35 callers: w2={7×29, 8×5, 12×1}); настоящий newthread пишет тег 0xA в слот значения.
+- lua_pcall        0x10295432c  через код регистрации lbaselib (pcall/xpcall НЕТ в
+  luaL_Reg-таблицах 0.739 — регистрируются setfield'ом), xpcall=0x1029544ac
+- rawload          0x10140ce20  = пересечение (callers luau_load) ∩ (BL-цели
+  loadstring-обёртки 0x10141a830). Это compile-and-load ядро Roblox.
+
+## resume split: закрыт
+0x10295c5e0 = coroutine.close (доказано: зарегистрирована парой {"close", fn} в
+обеих копиях lcorolib + несёт «cannot close %s coroutine»). Настоящий resume —
+0x10295be9c. Кроссчек «BL в stack-alloc callee» (rawrunprotected-форма) — OK.
+Прямых BL на lua_resume в бинаре 0 — игра зовёт через указатель (как на 0.735),
+значит старый bp мог стоять на внутреннем body. Проверка на живом процессе —
+после снятия Hyperion.
+
+## Уроки деривации (упало/поднялось в этой сессии)
+- lr_fn_bl_targets по фикс-окну 0x800 тянет BL из СЛЕДУЮЩЕЙ функции (create —
+  0x44 байта) →movz#8 соседа отравляет фингерпринт. Лечится границей по fn_end.
+- lr_fn_end: первый ret — рано (early return); ret+entry-проверка следующей
+  инструкции — поздно (out-of-line error-хвост между ret и prologue соседа
+  глотает его константы: xmove→хвост с luaL_error→чужой movz#0xA). Финальное
+  правило: terminator подтверждён entry-формой В ОКНЕ 8 инструкций.
+- LUA_TTHREAD у аллокатора значений = 0xA (TTAG bit5), сырой тег 0x6/0x8 —
+  параметры фабрик, а не теги значений.
+
+## executor_core: константы выпилены
+g_exec_fn больше не держит 0.735-адреса — резолвер/деривация единственный
+источник. legacy-путь сохранён для 0.735. В executor_resolve добавлен
+деривационный fallback для newthread/pcall/rawload.
+
+## Осталось (приоритет)
+1. Опкод-карта 0.739: dispatch @0x106874b30 (2×256, хендлеры — блоки ВНУТРИ
+   luaV_execute 0x102977d9c, span ~0x9400), ремап изменился против 0.735
+   (слот 2 занят, 22 занят, 5/33 NULL). Канонические NULL-слоты 0.735 мертвы.
+2. Hyperion/adhoc: переподписать 0.739 (как делали на 0.735), держать
+   воспроизводимым → живая проверка __RESOLVE__ + resume-брейкпоинт.
+3. luaL_argerror: новый якорь уже в таблице (закрыто).
+4. luaD_growstack: остаётся кандидатом (17 fns на «stack overflow») —
+   приоритет низкий, символ не в exec-пайплайне.
+
+## Приоритет 3 закрыт наполовину: adhoc-ресайн автоматизирован
+tools/resign_adhoc.sh — идемпотентный (проверяет TeamIdentifier, бэкапит
+оригинал ОДИН раз в .orig-739, умеет --restore / --force). Процедура та же,
+что на 0.735/0.736: remove-signature → codesign -s - --deep. Клиент на диске
+0.739.0.7390687 (официальная подпись 2CFABCH843, hardened runtime) — скрипт
+это детектит и готов к запуску. САМ ресайн не запускал — нужна команда He
+(меняет подпись системного приложения).
+
+## ЖИВАЯ ПРОВЕРКА 0.739: инжект работает, резолвер подтверждён (2026-09-22)
+
+### Процедура запуска (воспроизводимая)
+1. tools/resign_adhoc.sh — снял официальную подпись (2CFABCH843, hardened) → adhoc.
+   Бэкап оригинала: ~/roblox_backups/RobloxPlayer.orig-739 (скрипт теперь кладёт туда).
+   ВАЖНО: бэкап НОСИТЬ ВНЕ бандла — .orig рядом с бинарником ломает seal бандла
+   ("invalid Info.plist" + CODESIGNING kill "Taskgated Invalid Signature").
+2. Запуск НЕ через bash (фоновый процесс без GUI умирает сам за ~12-25с) и НЕ
+   через launchctl setenv (не прокидывается): рабочий путь —
+   osascript 'do shell script "open -a /Applications/Roblox.app --env
+   DYLD_INSERT_LIBRARIES=.../payload.dylib"'. macOS 27 пропускает DYLD_* через
+   open --env; клиент живёт минутами (GUI-сессия настоящая).
+3. IPC: /tmp/inj_ipc_501.sock. __RESOLVE__ отвечает за ~2.5с.
+
+### Результат __RESOLVE__ (живой, 67751, slide=0x9f4000)
+- Все 7 офлайн-символов сошлись с live с точностью до slide: lua_resume,
+  luaD_growstack, luaG_runerror, luaL_argerror, luau_load, lua_newthread,
+  lua_pcall — ALL MATCH.
+- exec pipeline: newthread/resume/luau_load/pcall = OK, verdict: execution
+  symbols available. rawload/loadstring/luaS_newlstr — «no legacy constant»
+  (derive rawload в exec-pipeline не добавлен в отчёт — дообделать).
+- luaL_argerror live=0x1033468b4 verified=1 — НОВЫЙ якорь подтверждён живьём.
+
+### Производственный баг, найденный live-прогоном
+lr_find_reg_pairs на живом образе сканировал десятки МБ per-8-байтовыми
+mach_vm_read (сэмпл: 571/571 в lr_find_reg_pairs→img_reader→mach trap) —
+__RESOLVE__ висел 10+ минут. Фикс: bulk-read секции одним вызовом + скан в
+памяти (fallback на per-slot остался). После фикса resolve = 2.5с.
+
+# СЕССИЯ 2026-10-03/04 НОЧЬ: КОМПИЛЯТОР + РЕМАП РАБОТАЮТ, print В КЛИЕНТЕ
+
+## Главные результаты
+1. **Собран upstream luau-compile (клон /tmp/luau-src, LBC_VERSION_TARGET=9 —
+   версия клиента!): `--fflags=false --binary` даёт байткод, который клиент
+   ГРУЗИТ (luau_load ret=0).**
+2. **РЕМАП ОПКОДОВ 0.741 выведен экспериментально (пробы через BC:):
+   PREPVARARGS(65)→82, RETURN(22)→130, LOADK(5)→111, LOADN(4)→140,
+   GETIMPORT(12)→164, CALL(21)→159, GETTABLEKS(15)→77, MOVE(6)→144,
+   DUPCLOSURE(64)→{0,251,163,47} (4 кандидата, все дают корректный результат).
+   Рабочая таблица диспетчера = «зеркало» (link 0x106a39bd0+, 242 слота), не
+   основная (91).
+3. **print("XFLY123") ИЗ НАШЕГО БАЙТКОДА ВЫПОЛНИЛСЯ В КЛИЕНТЕ** (лог
+   [FLog::CreatorOutput]). print(game) — тоже. 1-уровневые импорты
+   (print, game, workspace) резолвятся.
+4. Пробы: инструмент probe() в /tmp/quick.py, ремапер /tmp/remap.py
+   (v9-парсер с AUX-aware patcher — формат из lvmload.cpp), рабочий
+   фловорк: /tmp/flyremap.py.
+
+## Оставшиеся блокеры для fly.lua
+1. **Инстанс-поля (2-уровневые импорты game.X, GETTABLEKS на Instance)**
+   дают "invalid argument #1 (Instance expected, got ...)" — это
+   **атом-механизм лоадера**: GETTABLEKS с атом-строкой переписывается в
+   GETUDATAKS(83) НА ЭТАПЕ ЗАГРУЗКИ (lvmload.cpp:680-707). Наш патч 15→77
+   ломает авто-перепись (лоадер не узнаёт 77 как GETTABLEKS). Без патча
+   (15 raw) чанк падает "bytecode corrupted" — надо понять, какой слот
+   клиент ждёт для GETUDATAKS-атомов (возможно слот 83 зеркала).
+2. **DUPCLOSURE=0/251/163/47** — один из 4, финализировать пробой в контексте.
+3. Мульти-прото чанки: парсер спотыкается на хвосте прото (lineinfo gap=24?!)
+   — обход: хардкод код-регионов (флай: callback@146 ncode=23, main@312,
+   main начинается с PREP 0x41 — ищется сканом).
+
+## Конвейер запуска (полный, проверенный)
+```bash
+cd ~/Documents/coding/Vibecoded/inj && make
+pkill -9 -x RobloxPlayer; nohup /Applications/Roblox.app/Contents/MacOS/RobloxPlayer >/tmp/inj_launch.log 2>&1 &
+sleep 8; ./live_inject.sh; open "roblox://experiences/start?placeId=1818"; sleep 30
+# скомпилировать + ремап + исполнить:
+python3 /tmp/quick.py  # chunk_with(src, MAP) + run_bc(blob)
+```

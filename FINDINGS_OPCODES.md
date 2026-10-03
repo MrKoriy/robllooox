@@ -172,3 +172,34 @@ kDispatchTable @ __DATA_CONST link 0x106eed6c0 (file offset 0x6eed6c0)
 - Compiler binary: `/var/folders/.../luau-v9/build/luau-compile` (rebuilt Aug 24 13:36)
 - Test payload bc: `/tmp/payload.bc` (95 bytes)
 - Hex payload: `/tmp/payload_hex.txt`
+
+---
+
+# 0.739 dispatch-экстракция (2026-09-22, tools/opcode_probe.py)
+
+- **kDispatchTable = 0x106874b30 (link)**, 2×256: основной + зеркало с ДРУГИМИ
+  адресами (94 зеркальных расхождений) — зеркало это НЕ дубликат, а вторая
+  точка входа (fastpath/ profiling-варианты). Обрабатывать как отдельные таблицы.
+- 94 non-null слота (не 91 как в 0.735/0.736), все хендлеры — блоки ВНУТРИ
+  luaV_execute (0x102977d9c, span 0x93c4), уникальных тел 91.
+- **Старая карта 0.735 мертва**: пересечение занятых слотов 28/74 при
+  случайных ~27 — полный ремап. Прямое наследование слота НЕ работает
+  (735 CLOSEUPVALS=146 → 739 slot 54; 735 NEWCLOSURE=237 → 739 slot 3).
+- Контентные якоря (доказаны BL-анализом, бинарно-уникальны):
+  - **slot 3 = NEWCLOSURE** (единственный хендлер, зовущий luaF_newLclosure
+    @0x102972788 среди 46 callers по бинару)
+  - **slot 54 = CLOSEUPVALS** (единственный зовущий luaF_findupval @0x102977740)
+  - slot 13 — пара к NEWCLOSURE (общий helper 0x10297789c, 2 callers)
+  - slot 169 несёт строку "iterate over" (FORGLOOP-семья?)
+  - slot 0, 67, 126, 227, 219, 66, 104 — редкие callee-якоря, см. отчёт
+- Signature-кластеры (size, n_indirect, n_calls) в /tmp/opcode739_report.json:
+  8×(60,0,0) slots=[15,39,70,75,82,171,184,230] — JUMP-семья?
+  5×(68,0,0) slots=[21,71,111,233,241] — LOADN/LOADB/NIL-семья?
+- **NInd-загадка**: 0 хендлеров с ret-return — весь VM-exit через общий
+  эпилог luaV_execute (br-хвосты), т.е. хендлеры НЕ самодостаточные функции.
+  Полная верификация 91 слота офлайн почти невозможна без интерпретации
+  потоков внутри гигантского тела — нужен ЖИВОЙ прогон (ресайн + bp на
+  dispatch) или интерпретация CFG.
+- rbxRemapOp/bcverify на 0.735-карте — НЕГОДНЫ для 0.739 (как и предсказано).
+  Мост: у нас есть 3 доказанных якоря + 91 сигнатура; после adhoc-ресайна
+  bp на диспетчере даст (op → handler) маппинг живьём за один джойн.

@@ -28,7 +28,17 @@ $(TARGET): payload_c.o executor_core.o
 test: $(TARGET)
 	@python3 tools/smoke_test.py
 
-clean:
-	rm -f $(TARGET) *.o
+# Offline verification of the runtime symbol resolver against the installed
+# client: runs the exact resolver code the dylib uses, in link-time address
+# space, and prints every resolved address plus its drift vs the old
+# constants. Fails when a required symbol stops resolving after an update.
+resolvetest: tools/resolver_selftest.cpp luau_resolver.h
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -o resolver_selftest tools/resolver_selftest.cpp
+	./resolver_selftest
 
-.PHONY: all test clean
+clean:
+	rm -f $(TARGET) *.o resolver_selftest
+
+.PHONY: all test resolvetest clean
+
+
