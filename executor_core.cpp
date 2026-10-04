@@ -2844,12 +2844,108 @@ static uintptr_t confirmed_main_thread(char* why, size_t why_len) {
         if (best < 0 || g_live_pri[i] > g_live_pri[best]) best = i;
     }
     if (best < 0) {
+        /* accept a game coroutine directly: find the most popular G among
+         * the candidates (the game universe) and take the highest-priority
+         * candidate with that G — scheduler coroutines carry the game
+         * identity and the runner works on them like on the main. */
+        uintptr_t gc_g[256]; int gc_n[256]; int ngc = 0;
+        for (int i = 0; i < g_live_n; i++) {
+            uintptr_t G = 0;
+            if (!safe_read(g_live_L[i] + LUA_G_OFF, &G, 8)) continue;
+            if (G < 0x100000000ULL || G > 0x16000000000ULL || (G & 0xF) != 0) continue;
+            int found = -1;
+            for (int q = 0; q < ngc; q++) if (gc_g[q] == G) { found = q; break; }
+            if (found >= 0) gc_n[found]++;
+            else if (ngc < 256) { gc_g[ngc] = G; gc_n[ngc] = 1; ngc++; }
+        }
+        uintptr_t gameG = 0; int gameGn = 0;
+        for (int q = 0; q < ngc; q++)
+            if (gc_n[q] > gameGn) { gameG = gc_g[q]; gameGn = gc_n[q]; }
+        LOG_CORE("MAIN: gameG=%p count=%d (ngc=%d)", (void*)gameG, gameGn, ngc);
+        if (gameG && gameGn >= 3) {
+            for (int i = 0; i < g_live_n; i++) {
+                uintptr_t G = 0;
+                safe_read(g_live_L[i] + LUA_G_OFF, &G, 8);
+                if (G != gameG) continue;
+                /* relaxed: parked coroutines have top <= stack — accept them */
+                {
+                    uintptr_t stk = 0, tp = 0;
+                    safe_read(g_live_L[i] + LUA_STACK_OFF, &stk, 8);
+                    safe_read(g_live_L[i] + LUA_TOP_OFF, &tp, 8);
+                    if (tp < stk - 0x1000ULL || tp > stk + 0x400000ULL) continue;
+                }
+                /* status byte @+3: 0=OK, 1=YIELD(parked), 2+=dead — skip dead */
+                {
+                    uint8_t st = 0xff;
+                    safe_read(g_live_L[i] + LUA_STATUS_OFF, &st, 1);
+                    if (st != 1) continue;
+                }
+                if (best < 0 || g_live_pri[i] > g_live_pri[best]) best = i;
+            }
+            /* re-check status NOW (the game may have killed the
+             * coroutine between the scan and this call) */
+            for (int tries = 0; tries < 5; tries++) {
+                uint8_t st = 0xff;
+                safe_read(g_live_L[best] + LUA_STATUS_OFF, &st, 1);
+                if (st == 1) break;
+                best = -1;
+                for (int i2 = 0; i2 < g_live_n; i2++) {
+                    uintptr_t G2 = 0;
+                    safe_read(g_live_L[i2] + LUA_G_OFF, &G2, 8);
+                    if (G2 != gameG) continue;
+                    uint8_t st2 = 0xff;
+                    safe_read(g_live_L[i2] + LUA_STATUS_OFF, &st2, 1);
+                    if (st2 != 1) continue;
+                    if (best < 0 || g_live_pri[i2] > g_live_pri[best]) best = i2;
+                }
+                if (best < 0) break;
+            }
+            if (best >= 0) {
+                g_main_L = g_live_L[best];
+                safe_read(g_main_L + LUA_G_OFF, &g_main_G, 8);
+                LOG_CORE("MAIN: game-coroutine DIRECT L=%p G=%p (count=%d)",
+                         (void*)g_main_L, (void*)gameG, gameGn);
+                return g_main_L;
+            }
+        }
+    }
+    if (best < 0) {
+        LOG_CORE("MAIN: fallback entered (live=%d)", g_live_n);
         /* Fallback: the fresh-coroutine signature hunt misses long-running
          * game VMs (their coroutines are scheduler-recycled and never match
          * the init shape). Discover universes by shape-scanning the whole
          * heap for lua_State-like objects, then take G->mainthread of each. */
         uintptr_t gseen[32];
         int ngseen = 0;
+        /* Seed gseen with the Gs of the ALREADY-FOUND candidates: the game
+         * coroutines stored in g_live carry the game universe's G — the
+         * heap-order shape scan below can miss them (menu universes fill
+         * the 32 slots first because they sit lower in the heap). */
+        /* Count G popularity across ALL candidates — the game universe has
+         * the MOST coroutines, so the most-frequent G = the game G. */
+        {
+            uintptr_t gcount_g[64]; int gcount_n[64]; int ngc = 0;
+            for (int i = 0; i < g_live_n && ngc < 64; i++) {
+                uintptr_t G = 0;
+                if (!safe_read(g_live_L[i] + LUA_G_OFF, &G, 8)) continue;
+                if (G < 0x100000000ULL || G > 0x16000000000ULL || (G & 0xF) != 0) continue;
+                int found = -1;
+                for (int q = 0; q < ngc; q++)
+                    if (gcount_g[q] == G) { found = q; break; }
+                if (found >= 0) gcount_n[found]++;
+                else if (ngc < 64) { gcount_g[ngc] = G; gcount_n[ngc] = 1; ngc++; }
+            }
+            /* sort by count desc — the game G first */
+            for (int a = 0; a < ngc; a++)
+                for (int b = a + 1; b < ngc; b++)
+                    if (gcount_n[b] > gcount_n[a]) {
+                        uintptr_t tg = gcount_g[a]; int tn = gcount_n[a];
+                        gcount_g[a] = gcount_g[b]; gcount_n[a] = gcount_n[b];
+                        gcount_g[b] = tg; gcount_n[b] = tn;
+                    }
+            for (int q = 0; q < ngc && ngseen < 32; q++)
+                gseen[ngseen++] = gcount_g[q];
+        }
         mach_vm_address_t addr = 0;
         mach_vm_size_t size = 0;
         uint8_t* chunk = (uint8_t*)malloc(1 << 20);
@@ -2909,31 +3005,36 @@ static uintptr_t confirmed_main_thread(char* why, size_t why_len) {
         for (int q = 0; q < ngseen; q++) {
             /* 0.740: the mainthread slot moved — find any G backref */
             uintptr_t mt = 0;
-            uint8_t gbuf2[0x2c0];
+            uint8_t gbuf2[0x400];
             if (!safe_read(gseen[q], gbuf2, sizeof(gbuf2))) continue;
+            LOG_CORE("MAIN: gseen[%d]=%p (ngseen=%d)", q, (void*)gseen[q], ngseen);
             for (int off = 0x20; off + 8 <= (int)sizeof(gbuf2) && !mt; off += 8) {
                 uintptr_t cand = *(uintptr_t*)(gbuf2 + off);
-                if (validate_main_thread(cand)) mt = cand;
+                if (validate_main_thread(cand)) { mt = cand; LOG_CORE("MAIN: backref hit at G+%#x -> %p", off, (void*)mt); }
             }
-            if (!mt) continue;
-            int dup = 0;
-            for (int z = 0; z < g_live_n; z++)
-                if (g_live_L[z] == mt) { dup = 1; break; }
-            if (!dup && g_live_n < MAX_LIVE_CANDS) {
-                uintptr_t st = 0, tp = 0, ci = 0;
-                safe_read(mt + LUA_STACK_OFF, &st, 8);
-                safe_read(mt + LUA_TOP_OFF, &tp, 8);
-                safe_read(mt + LUA_INNER_OFF, &ci, 8);
-                g_live_L[g_live_n] = mt;
-                g_live_ss[g_live_n] = ci;
-                g_live_stack[g_live_n] = st;
-                g_live_top[g_live_n] = unpack_top(tp);
-                g_live_tp[g_live_n] = tp;
-                g_live_pri[g_live_n] = 150;
-                LOG_CORE("MAIN: shape-main mt=%p G=%p (idx %d)", (void*)mt,
-                         (void*)gseen[q], g_live_n);
-                g_live_n++;
-                if (best < 0) best = g_live_n - 1;
+            if (mt) {
+                /* g_live is FULL of coroutines (512) — overwrite the LAST
+                 * slot with the real main instead of skipping it */
+                if (g_live_n >= MAX_LIVE_CANDS) g_live_n = MAX_LIVE_CANDS - 1;
+                int dup = 0;
+                for (int z = 0; z < g_live_n; z++)
+                    if (g_live_L[z] == mt) { dup = 1; break; }
+                if (!dup) {
+                    uintptr_t st = 0, tp = 0, ci = 0;
+                    safe_read(mt + LUA_STACK_OFF, &st, 8);
+                    safe_read(mt + LUA_TOP_OFF, &tp, 8);
+                    safe_read(mt + LUA_INNER_OFF, &ci, 8);
+                    g_live_L[g_live_n] = mt;
+                    g_live_ss[g_live_n] = ci;
+                    g_live_stack[g_live_n] = st;
+                    g_live_top[g_live_n] = unpack_top(tp);
+                    g_live_tp[g_live_n] = tp;
+                    g_live_pri[g_live_n] = 150;
+                    LOG_CORE("MAIN: shape-main mt=%p G=%p (idx %d)", (void*)mt,
+                             (void*)gseen[q], g_live_n);
+                    g_live_n++;
+                    if (best < 0) best = g_live_n - 1;
+                }
             }
         }
     }
@@ -3071,7 +3172,7 @@ static int exec_resume(uintptr_t co, uintptr_t fromL) {
  * Frame protocol: closure at stack slot 0 (ci->func = base-1), top = base
  * (stack+0x10), count = 1, status = 0 (FRESH — status=1 would take the
  * yield-continuation path and walk a garbage CallInfo chain). */
-static int exec_run(uintptr_t co) {
+static int exec_run(uintptr_t co, uintptr_t from) {
     uintptr_t slide = executor_image_slide();
     uintptr_t fn = 0x1026e8df0ULL + slide;
     uint32_t first = 0;
@@ -3090,7 +3191,7 @@ static int exec_run(uintptr_t co) {
     int jv = sigsetjmp(g_exec_jmp, 1);
     if (jv == 0) {
         try {
-            r = ((int (*)(uintptr_t, uintptr_t, int))fn)(co, 0, 0);
+            r = ((int (*)(uintptr_t, uintptr_t, int))fn)(co, 0, 1);
         } catch (const std::exception& e) {
             r = -3;
             LOG_CORE("EXEC: run exc: %s", e.what());
@@ -3488,7 +3589,56 @@ extern "C" int executor_exec_gamestate(const char* code, char* out, size_t out_l
                  (unsigned long long)c[5]);
     }
 
-    int r = exec_run(co);
+    /* Identity fix: the game's native methods (GetService/Connect) check
+     * the calling thread's identity in the ExtraSpace before L. Our fresh
+     * co has a zero identity -> "The current thread cannot connect".
+     * Copy the ExtraSpace words from the game's main thread (the identity
+     * lives in the 0x18 bytes BEFORE the lua_State object). */
+    {
+        uintptr_t before_co[8] = {0};
+        uintptr_t before_main[8] = {0};
+        safe_read(co - 0x18, before_co, 0x18);
+        safe_read(L - 0x18, before_main, 0x18);
+        LOG_CORE("EXEC: extraspace co={%#llx,%#llx,%#llx} main={%#llx,%#llx,%#llx}",
+                 (unsigned long long)before_co[0],
+                 (unsigned long long)before_co[1],
+                 (unsigned long long)before_co[2],
+                 (unsigned long long)before_main[0],
+                 (unsigned long long)before_main[1],
+                 (unsigned long long)before_main[2]);
+        if (is_memory_writable(co - 0x18)) {
+            /* copy the shared-block pointer + identity + caps */
+            *(uintptr_t*)(co - 0x18) = before_main[0];
+            *(uintptr_t*)(co - 0x10) = before_main[1];
+            *(uintptr_t*)(co - 0x08) = before_main[2];
+            LOG_CORE("EXEC: extraspace copied from main");
+        }
+    }
+
+    /* Identity fix (full): copy BOTH the lua_State tail fields (+0x40..0x88)
+     * AND the Roblox wrapper (+0x88..0xc0) from the main thread. The
+     * natives check the thread's identity which lives in this region —
+     * a fresh lua_newthread co is all-zero there. */
+    {
+        uintptr_t wmain[16] = {0};
+        safe_read(L + 0x40, wmain, 8 * 8);
+        safe_read(L + 0x88, wmain + 8, 8 * 8);
+        if (is_memory_writable(co + 0x40)) {
+            for (int k = 0; k < 16; k++)
+                *(uintptr_t*)(co + 0x40 + k * 8) = wmain[k];
+            LOG_CORE("EXEC: thread tail+wrapper copied from main (identity=%llu)",
+                     (unsigned long long)(wmain[13] & 0xffffffff));
+        }
+    }
+
+    /* write the closure at BOTH top-0x10 AND top: the runner's start
+     * reads the function from different slots depending on the path */
+    if (top >= 0x100000000ULL && is_memory_writable(top)) {
+        *(uint64_t*)top = fv;
+        *(uint32_t*)(top + 0xc) = 8;
+        LOG_CORE("EXEC: closure also written at top=%p", (void*)top);
+    }
+    int r = exec_run(co, 0);
     LOG_CORE("EXEC: run(co=%p) -> %d", (void*)co, r);
     log_thread_state("CO-AFTER", co);
     /* dump the top stack slots raw — the error object hunting ground */

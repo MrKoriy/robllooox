@@ -808,3 +808,81 @@ x3=0x110bbd8c0 (wrapper). Строка "RunService" НЕ дошла до мет�
 ## План следующей сессии (механический)
 1. Свип DUPCLOSURE на свежем клиенте с корректным чанком (без PREP).
 2. Если closure работает — fly8.lua готов, RUN.
+
+# ФИНАЛЬНАЯ СЕССИЯ 2026-10-05 (03:00): полный разбор раннера + статус
+
+## Ключевые открытия этой сессии
+
+1. **DUPCLOSURE(64)→192** (из реального чанка: op=192 с D=4 = closure load!)
+   Замыкания создаются и вызываются: `return (function() return "XUP" end)()`
+   → pcall=0 + "XUP" в результате!
+2. **GETUPVAL работает автоматически** (замыкания с апвалами тоже работают:
+   `local x = "UP" return (function() return x end)()` → "UP")
+3. **Мульти-прото парсер полностью исправлен** — баг `o, _ = read_varint`
+   (13 мест, присваивал значение вместо офсета) — теперь 2-прото чанки
+   парсятся и патчатся корректно.
+4. **GETTABLEKS на инстансах**: `game.ClassName` → "DataModel" ✓,
+   `game.Players.ClassName` → "Players" ✓ — цепочки работают!
+5. **NAMECALL на СТРОКАХ работает**: `("x"):len()` → 1 ✓
+6. **NAMECALL на ИНСТАНСАХ**: `game.RunService.Heartbeat:Connect(...)` →
+   "The current thread cannot connect 'Heartbeat' (lacks identity)" —
+   метод ВЫЗЫВАЕТСЯ, но identity не проходит.
+7. **Полная карта опкодов 0.741 (10 слотов, верифицировано)**:
+   PREP 65→82, RETURN 22→130, LOADK 5→111, LOADN 4→140, GETIMPORT 12→164,
+   CALL 21→159, GETTABLEKS 15→77, MOVE 6→144, NAMECALL 20→95,
+   **DUPCLOSURE 64→192**.
+
+## Проблема main-thread (решена наполовину)
+- Сканирование heap находит 512 кандидатов (коротины меню + игры).
+- G-популярностный анализ: game G = самый частый G среди кандидатов.
+- **game-coroutine fallback**: берёт живую игровую корутину с game G
+  и status==1 (YIELD-паркованная) — прямое возвращение из confirmed_main_thread.
+- Проблема: скан занимает ~30 сек (main-thread scan медленный),
+  статусы меняются между сканом и exec (гонка).
+
+## Раннер (глубокий разбор)
+- 0x1026e8df0(thread, from, count):
+  - **ПРЕ-ЧЕК** 0x1026e8e88: [thread+3] должен быть 1 (YIELD) или 6 (BREAK)!
+    Status 0 (fresh) = «dead» для раннера!
+  - Путь YIELD-продолжения: восстанавливает ci-цепочку (наши fresh co
+    не имеют таковой → краш при status=1).
+  - Путь START (status==0): 0x1026e6104(thread, from) — читает [from+3],
+    [from+0x60/0x70] — from=0 → NULL DEREF; from=game-co → работает,
+    но count = (from.top - from.base)/16 — положительный → раннер
+    просто возвращает count БЕЗ исполнения.
+  - 0x1026e6060(co, count): count >= 0 → return count (no exec);
+    count = -1 → НАСТОЯЩИЙ запуск (вызывается только из error-путей).
+- Вывод: раннер в проде используется ТОЛЬКО для YIELD-resume игровых
+  корутин. Для ЗАПУСКА нового кода игра использует ДРУГОЙ путь
+  (вероятно 0x1026e8250 rawrunprotected напрямую или через ScriptContext).
+
+## Что работает прямо сейчас (можно проверить)
+```lua
+-- через BC: (компиляция + ремап + BC-протокол)
+print("hello")           -- ✓ работает
+return ("x"):len()       -- ✓ 1
+local g = game
+return g.ClassName       -- ✓ "DataModel"
+return g.Players.ClassName -- ✓ "Players"
+local f = function() return 42 end return f() -- ✓ 42
+local x = "cap" return (function() return x end)() -- ✓ "cap"
+```
+
+## Осталось (чётко очерчено)
+1. **Раннер для fresh co**: найти вход, который запускает НОВЫЙ код
+   (не yield-resume). Кандидаты: rawrunprotected 0x1026e8250 напрямую
+   с run_fn 0x1026e8f54; или ScriptContext::loadScript-цепочка
+   (0x10150c578-регион); или захукать yield-resume так, чтобы ci
+   указывал на наш closure.
+2. **Identity для инстанс-методов**: после решения #1 — ран на игровой
+   корутине (identity у неё правильный) должен пропустить
+   Connect/GetService.
+3. После этого fly8.lua (уже написан) взлетает.
+
+## Инструменты (сохранены в /tmp)
+- /tmp/quick.py — компиляция+ремап+отправка (chunk_with/run_bc)
+- /tmp/remap.py — v9 парсер+ремапер (исправленный)
+- /tmp/dispatch741.json — таблица диспетчера (242 слота, зеркало)
+- /tmp/handler_callees.json — BL-цели хендлеров
+- /tmp/rbx741_disasm.txt — полный дизассембл (851МБ)
+- /tmp/flyremap.py, /tmp/fly8.lua — заготовка флая
