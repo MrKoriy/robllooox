@@ -503,6 +503,13 @@ static char *handle_control_command(const char *msg) {
         executor_resolve(out, 16384);
         return out;
     }
+    if (n >= 9 && strncmp(msg, "__CANDS__", 9) == 0) {
+        extern int executor_list_candidates(char*, size_t);
+        char* out = malloc(32768);
+        if (!out) return strdup("ERR: oom");
+        executor_list_candidates(out, 32768);
+        return out;
+    }
     if (n >= 7 && strncmp(msg, "__DIAG__", 8) == 0) {
         char* out = malloc(2048);
         if (!out) return strdup("ERR: oom");

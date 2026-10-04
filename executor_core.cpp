@@ -18,6 +18,7 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <mach/mach_vm.h>
 #include <libkern/OSCacheControl.h>
 #include <mach-o/dyld.h>
@@ -1785,8 +1786,22 @@ static void find_live_thread(void) {
     int coro_stored = 0;
     uintptr_t gbest = 0;
     int bestn = 0;
+    /* scan wall-clock baseline shared by the pass and region-loop checks */
+    static mach_timebase_info_data_t tb_s;
+    static int tb_s_init = 0;
+    if (!tb_s_init) { mach_timebase_info(&tb_s); tb_s_init = 1; }
+    uint64_t scan_t0 = mach_absolute_time();
     for (int pass = 0; pass < 8; pass++) {
         LOG_CORE("EXEC: scan pass %d", pass);
+        {
+            uint64_t now = mach_absolute_time();
+            double elapsed = (double)(now - scan_t0) * (double)tb_s.numer /
+                             ((double)tb_s.denom * 1e9);
+            if (elapsed > 45.0) {
+                LOG_CORE("EXEC: scan deadline hit (%.1fs) — stopping", elapsed);
+                break;
+            }
+        }
         /* pick the most frequent G seen among fresh coroutines */
         for (int q = 0; q < g_coro_n; q++)
             if (g_coro_cnt[q] > bestn) { bestn = g_coro_cnt[q]; gbest = g_coro_G[q]; }
@@ -1855,6 +1870,8 @@ static void find_live_thread(void) {
         }
         uint32_t c_tt9 = 0, c_g = 0;
         uint32_t c_ptr = 0, c_d = 0, c_span = 0, c_gread = 0, c_gsize = 0, c_final = 0;
+        /* ascending walk (descending probes never reach the malloc heap
+         * through the read-only mappings at the top of the space) */
         mach_vm_address_t addr = 0;
         mach_vm_size_t size = 0;
         while (1) {
@@ -1865,13 +1882,28 @@ static void find_live_thread(void) {
                                               VM_REGION_BASIC_INFO_64,
                                               (vm_region_info_t)&info, &cnt, &object_name);
             if (kr != KERN_SUCCESS) break;
-            if ((info.protection & VM_PROT_READ) && (info.protection & VM_PROT_WRITE) &&
-                addr >= 0x100000000ULL && addr < 0x16000000000ULL &&
-                size >= 0x4000 && size < 0x80000000ULL) {
+            if (!(info.protection & VM_PROT_READ) || !(info.protection & VM_PROT_WRITE) ||
+                addr < 0x100000000ULL || addr >= 0x16000000000ULL ||
+                size < 0x4000 || size >= 0x80000000ULL) {
+                addr += size;
+                continue;
+            }
                 uint8_t* chunk = (uint8_t*)malloc(1 << 20);
                 if (!chunk) break;
                 mach_vm_size_t done = 0;
                 while (done + (1 << 20) <= size) {
+                    /* region-loop deadline: a single huge region must not
+                     * wedge the IPC thread either */
+                    {
+                        uint64_t now2 = mach_absolute_time();
+                        double el2 = (double)(now2 - scan_t0) * (double)tb_s.numer /
+                                     ((double)tb_s.denom * 1e9);
+                        if (el2 > 50.0) {
+                            LOG_CORE("EXEC: region-loop deadline (%.1fs) — aborting scan", el2);
+                            free(chunk);
+                            goto scan_done;
+                        }
+                    }
                     mach_vm_size_t got = 0;
                     uintptr_t cbase = addr + done;
                     if (mach_vm_read_overwrite(mach_task_self(), cbase,
@@ -1945,6 +1977,21 @@ static void find_live_thread(void) {
                                 int dup = 0;
                                 for (int q = 0; q < g_live_n; q++)
                                     if (g_live_L[q] == L) { dup = 1; break; }
+                                /* G-diversification: once a G dominates the
+                                 * candidate list (e.g. the menu universe's
+                                 * hundreds of threads), stop adding more of
+                                 * it so later heap regions (the GAME
+                                 * universe, allocated at join time) still
+                                 * get represented. */
+                                if (!dup && g_live_n < MAX_LIVE_CANDS) {
+                                    int gcount = 0;
+                                    for (int q = 0; q < g_live_n; q++) {
+                                        uintptr_t qg = 0;
+                                        safe_read(g_live_L[q] + LUA_G_OFF, &qg, 8);
+                                        if (qg == g) gcount++;
+                                    }
+                                    if (gcount >= 200) dup = 1;
+                                }
                                 if (!dup && g_live_n < MAX_LIVE_CANDS) {
                                     thr_register(L);
                                     g_live_L[g_live_n] = L;
@@ -2205,7 +2252,6 @@ static void find_live_thread(void) {
                     done += got;
                 }
                 free(chunk);
-            }
             addr += size;
         }
         LOG_CORE("EXEC: pass %d done tt9=%u ptr=%u d=%u span=%u gread=%u gsize=%u final=%u stored=%d",
@@ -2227,6 +2273,9 @@ static void find_live_thread(void) {
             }
         }
     }
+    return;
+scan_done:
+    LOG_CORE("EXEC: scan aborted by deadline (live=%d)", g_live_n);
 }
 
 static uint32_t g_pcall_orig_insn;
@@ -2833,12 +2882,43 @@ static bool validate_main_thread(uintptr_t L) {
 
 /* Returns the live game main thread, running the full heap hunt only when
  * the cached pointer is missing or stale.why gets the failure reason. */
+static bool validate_usable_thread(uintptr_t L) {
+    if (L < 0x100000000ULL || L > 0x16000000000ULL || (L & 0xF) != 0) return false;
+    uint8_t lh[0x88];
+    if (!safe_read(L, lh, sizeof(lh))) return false;
+    if (lh[LUA_TT_OFF] != 0xA) return false;
+    uintptr_t G = *(uintptr_t*)(lh + LUA_G_OFF);
+    if (G < 0x100000000ULL || G > 0x16000000000ULL || (G & 0xF) != 0) return false;
+    uintptr_t stack = *(uintptr_t*)(lh + LUA_STACK_OFF);
+    if (stack < 0x100000000ULL || stack > 0x16000000000ULL) return false;
+    if (!lua_thread_magic_ok(L)) return false;
+    return true;
+}
+
 static uintptr_t confirmed_main_thread(char* why, size_t why_len) {
-    if (g_main_L && validate_main_thread(g_main_L)) return g_main_L;
+    /* The cached main does not have to be THE mainthread: any live thread
+     * carrying the right G works as the lua_newthread parent (identity +
+     * env come from G). This keeps the lock on the GAME universe even when
+     * the parked coroutine we captured gets recycled by the scheduler. */
+    if (g_main_L && validate_usable_thread(g_main_L)) {
+        uintptr_t G = 0;
+        safe_read(g_main_L + LUA_G_OFF, &G, 8);
+        if (!g_main_G || G == g_main_G) { g_main_G = G; return g_main_L; }
+    }
     g_main_L = 0;
-    g_main_G = 0;
     find_live_thread();
     int best = -1;
+    /* prefer candidates carrying the remembered game G */
+    if (g_main_G) {
+        for (int i = 0; i < g_live_n; i++) {
+            uintptr_t G = 0;
+            safe_read(g_live_L[i] + LUA_G_OFF, &G, 8);
+            if (G != g_main_G) continue;
+            if (!validate_usable_thread(g_live_L[i])) continue;
+            if (best < 0 || g_live_pri[i] > g_live_pri[best]) best = i;
+        }
+        if (best >= 0) { g_main_L = g_live_L[best]; return g_main_L; }
+    }
     for (int i = 0; i < g_live_n; i++) {
         if (!validate_main_thread(g_live_L[i])) continue;
         if (best < 0 || g_live_pri[i] > g_live_pri[best]) best = i;
@@ -2874,11 +2954,14 @@ static uintptr_t confirmed_main_thread(char* why, size_t why_len) {
                     safe_read(g_live_L[i] + LUA_TOP_OFF, &tp, 8);
                     if (tp < stk - 0x1000ULL || tp > stk + 0x400000ULL) continue;
                 }
-                /* status byte @+3: 0=OK, 1=YIELD(parked), 2+=dead — skip dead */
+                /* status byte @+3: 0=OK, 1=YIELD(parked), 2+=dead — skip dead.
+                 * For the lua_newthread parent we only need the GAME G (so
+                 * the fresh co inherits the game universe's globals/env);
+                 * status 0 or 1 both work. */
                 {
                     uint8_t st = 0xff;
                     safe_read(g_live_L[i] + LUA_STATUS_OFF, &st, 1);
-                    if (st != 1) continue;
+                    if (st != 0 && st != 1) continue;
                 }
                 if (best < 0 || g_live_pri[i] > g_live_pri[best]) best = i;
             }
@@ -2887,7 +2970,7 @@ static uintptr_t confirmed_main_thread(char* why, size_t why_len) {
             for (int tries = 0; tries < 5; tries++) {
                 uint8_t st = 0xff;
                 safe_read(g_live_L[best] + LUA_STATUS_OFF, &st, 1);
-                if (st == 1) break;
+                if (st == 0 || st == 1) break;
                 best = -1;
                 for (int i2 = 0; i2 < g_live_n; i2++) {
                     uintptr_t G2 = 0;
@@ -2895,7 +2978,7 @@ static uintptr_t confirmed_main_thread(char* why, size_t why_len) {
                     if (G2 != gameG) continue;
                     uint8_t st2 = 0xff;
                     safe_read(g_live_L[i2] + LUA_STATUS_OFF, &st2, 1);
-                    if (st2 != 1) continue;
+                    if (st2 != 0 && st2 != 1) continue;
                     if (best < 0 || g_live_pri[i2] > g_live_pri[best]) best = i2;
                 }
                 if (best < 0) break;
@@ -3169,8 +3252,9 @@ static int exec_resume(uintptr_t co, uintptr_t fromL) {
  * through it): 0x1026e8df0(thread, from_or_0, count) — protected-runs the
  * function at thread.top - count*16 (the run_fn 0x1026e8f54 via
  * rawrunprotected 0x1026e8250, with the G+0x6d0/G+0x678 thread hooks).
- * Frame protocol: closure at stack slot 0 (ci->func = base-1), top = base
- * (stack+0x10), count = 1, status = 0 (FRESH — status=1 would take the
+ * Frame protocol: closure at top-1 (ci->func = top-16), count = 0 —
+ * func slot = top-(count+1)*16 = the closure; status = 0 (FRESH,
+ * ci==base_ci passes the pre-check; status=1 would take the
  * yield-continuation path and walk a garbage CallInfo chain). */
 static int exec_run(uintptr_t co, uintptr_t from) {
     uintptr_t slide = executor_image_slide();
@@ -3191,7 +3275,7 @@ static int exec_run(uintptr_t co, uintptr_t from) {
     int jv = sigsetjmp(g_exec_jmp, 1);
     if (jv == 0) {
         try {
-            r = ((int (*)(uintptr_t, uintptr_t, int))fn)(co, 0, 1);
+            r = ((int (*)(uintptr_t, uintptr_t, int))fn)(co, 0, 0);
         } catch (const std::exception& e) {
             r = -3;
             LOG_CORE("EXEC: run exc: %s", e.what());
@@ -3553,6 +3637,38 @@ extern "C" int executor_exec_gamestate(const char* code, char* out, size_t out_l
         return -1;
     }
     log_thread_state("CO-LOADED", co);
+    /* dump the freshly-loaded proto's code words: shows what the client's
+     * loader did to our wire opcodes (atom rewrites / renumbering) */
+    {
+        uintptr_t tp0 = 0;
+        safe_read(co + LUA_TOP_OFF, &tp0, 8);
+        uintptr_t top0 = unpack_top(tp0);
+        if (top0 >= 0x100000000ULL && is_memory_readable(top0 - 0x10)) {
+            uintptr_t clv = *(uintptr_t*)(top0 - 0x10);
+            uint32_t clt = 0;
+            safe_read(top0 - 0x10 + 0xc, &clt, 4);
+            LOG_CORE("PROTODUMP: closure=%#llx tt=%u", (unsigned long long)clv, clt);
+            if (clt == 8 && clv >= 0x100000000ULL && is_memory_readable(clv)) {
+                uintptr_t proto = *(uintptr_t*)(clv + 0x18);
+                LOG_CORE("PROTODUMP: proto=%#llx", (unsigned long long)proto);
+                if (proto >= 0x100000000ULL && is_memory_readable(proto)) {
+                    uintptr_t code = *(uintptr_t*)(proto + 0x50);
+                    uintptr_t karr = *(uintptr_t*)(proto + 0x10);
+                    LOG_CORE("PROTODUMP: code=%#llx k=%#llx",
+                             (unsigned long long)code, (unsigned long long)karr);
+                    if (code >= 0x100000000ULL && is_memory_readable(code)) {
+                        uint32_t w[24] = {0};
+                        safe_read(code, w, sizeof(w));
+                        for (int q = 0; q < 24; q++)
+                            LOG_CORE("PROTODUMP: code[%2d] = %08x  (op=%u A=%u B=%u C=%u D=%u)",
+                                     q, w[q], w[q] & 0xff, (w[q] >> 8) & 0xff,
+                                     (w[q] >> 16) & 0xff, (w[q] >> 24) & 0xff,
+                                     (w[q] >> 16) & 0xffff);
+                    }
+                }
+            }
+        }
+    }
 
     /* ---- run: lua_pcall executes the closure synchronously (0.741's
      * lua_resume only moves values — the scheduler runs game coroutines,
@@ -3612,32 +3728,41 @@ extern "C" int executor_exec_gamestate(const char* code, char* out, size_t out_l
             *(uintptr_t*)(co - 0x10) = before_main[1];
             *(uintptr_t*)(co - 0x08) = before_main[2];
             LOG_CORE("EXEC: extraspace copied from main");
+            /* ELEVATE: the copied identity often lacks game capabilities
+             * ("lacking capability Players") — force executor-level
+             * identity 7 with a broad capability mask on BOTH the co's
+             * ExtraSpace and the shared block. */
+            {
+                RobloxExtraSpace* es = (RobloxExtraSpace*)(co - 0x18);
+                es->identity = 7;
+                es->capabilities = ~0ULL;
+                if (es->shared && is_memory_writable((uintptr_t)es->shared)) {
+                    es->shared->identity = 7;
+                    es->shared->capabilities = ~0ULL;
+                    LOG_CORE("EXEC: identity elevated to 7 (shared=%p)",
+                             (void*)es->shared);
+                } else {
+                    LOG_CORE("EXEC: identity elevated to 7 (no shared block)");
+                }
+            }
         }
     }
 
-    /* Identity fix (full): copy BOTH the lua_State tail fields (+0x40..0x88)
-     * AND the Roblox wrapper (+0x88..0xc0) from the main thread. The
-     * natives check the thread's identity which lives in this region —
-     * a fresh lua_newthread co is all-zero there. */
-    {
-        uintptr_t wmain[16] = {0};
-        safe_read(L + 0x40, wmain, 8 * 8);
-        safe_read(L + 0x88, wmain + 8, 8 * 8);
-        if (is_memory_writable(co + 0x40)) {
-            for (int k = 0; k < 16; k++)
-                *(uintptr_t*)(co + 0x40 + k * 8) = wmain[k];
-            LOG_CORE("EXEC: thread tail+wrapper copied from main (identity=%llu)",
-                     (unsigned long long)(wmain[13] & 0xffffffff));
-        }
-    }
+    /* NOTE: do NOT copy lua_State fields +0x40..0xc0 from main here —
+     * that clobbers ci(+0x50)/base_ci(+0x58)/base(+0x60)/top(+0x70)/
+     * stack(+0x78) of the fresh co, which the runner's pre-check and
+     * func-slot computation depend on (was the "attempt to call a
+     * table" root cause). The ExtraSpace copy above (co-0x18) already
+     * carries identity for the natives. */
 
-    /* write the closure at BOTH top-0x10 AND top: the runner's start
-     * reads the function from different slots depending on the path */
-    if (top >= 0x100000000ULL && is_memory_writable(top)) {
-        *(uint64_t*)top = fv;
-        *(uint32_t*)(top + 0xc) = 8;
-        LOG_CORE("EXEC: closure also written at top=%p", (void*)top);
-    }
+    /* Frame protocol (disasm-verified): the runner computes
+     *   arg = co->top - count*16
+     * and the interpreter start path (0x1026e8f54, status==0) calls
+     *   luaD_call(co, arg-16, -1)   -> func = top - (count+1)*16.
+     * luau_load left the closure at top-1, so count MUST be 0:
+     * func = top-16 = the closure. The pre-check (0x1026e8e88) accepts
+     * status==0 when [co+0x50]==[co+0x58] (ci==base_ci, true for a fresh
+     * lua_newthread co) and from=NULL is handled (nCcalls=1). */
     int r = exec_run(co, 0);
     LOG_CORE("EXEC: run(co=%p) -> %d", (void*)co, r);
     log_thread_state("CO-AFTER", co);
@@ -3655,6 +3780,15 @@ extern "C" int executor_exec_gamestate(const char* code, char* out, size_t out_l
             safe_read(slot + 0xc, &t, 4);
             LOG_CORE("EXEC: slot[-%d] = %#llx tt=%u", k,
                      (unsigned long long)v, t);
+            /* decode string slots (tt=6): data at +0x18 in the TString */
+            if (t == 6 && v >= 0x100000000ULL && is_memory_readable((uintptr_t)v + 0x18)) {
+                char sb[48] = {0};
+                safe_read((uintptr_t)v + 0x18, sb, 44);
+                sb[44] = 0;
+                for (int c = 0; c < 44 && sb[c]; c++)
+                    if ((unsigned char)sb[c] < 0x20 || (unsigned char)sb[c] > 0x7e) sb[c] = '.';
+                LOG_CORE("EXEC: slot[-%d] STR = \"%s\"", k, sb);
+            }
         }
     }
 
@@ -3667,6 +3801,27 @@ extern "C" int executor_exec_gamestate(const char* code, char* out, size_t out_l
         n += snprintf(out + n, out_len - n, "\n");
     }
     return r;
+}
+
+/* List the live candidates from the last heap scan (__CANDS__): address,
+ * G, status — lets the operator pick a GAME-universe thread for __SETMAIN__. */
+extern "C" int executor_list_candidates(char* buf, size_t len) {
+    int n = 0;
+    n += snprintf(buf + n, len - n, "live=%d main=%p\n", g_live_n, (void*)g_main_L);
+    /* G popularity */
+    for (int i = 0; i < g_live_n && n < (int)len - 96; i++) {
+        uintptr_t L = g_live_L[i];
+        uintptr_t G = 0, stk = 0, tp = 0;
+        uint8_t st = 0xff;
+        safe_read(L + LUA_G_OFF, &G, 8);
+        safe_read(L + LUA_STACK_OFF, &stk, 8);
+        safe_read(L + LUA_TOP_OFF, &tp, 8);
+        safe_read(L + LUA_STATUS_OFF, &st, 1);
+        n += snprintf(buf + n, len - n, "cand %d L=%#llx G=%#llx st=%u top=%#llx\n",
+                      i, (unsigned long long)L, (unsigned long long)G,
+                      (unsigned)st, (unsigned long long)tp);
+    }
+    return n;
 }
 
 /* Interactive diagnostics for __DIAG__: main-thread cache + live snapshot. */
@@ -3703,9 +3858,25 @@ extern "C" int executor_set_main(uintptr_t thread_L, char* buf, size_t len) {
         }
     }
     if (!validate_main_thread(mt)) {
-        snprintf(buf, len, "ERR: G=%p mainthread %#lx invalid", (void*)G,
-                 (unsigned long)mt);
-        return -1;
+        /* No mainthread backref inside G+0x20..0x2c0 — fall back to the
+         * caller-supplied thread itself: for lua_newthread + identity we
+         * only need a live thread carrying the target G (a parked game
+         * coroutine is perfect). */
+        mt = 0;
+        uint8_t lh[0x88];
+        if (thread_L >= 0x100000000ULL && thread_L <= 0x16000000000ULL &&
+            !(thread_L & 0xF) && safe_read(thread_L, lh, sizeof(lh)) &&
+            lh[LUA_TT_OFF] == 0xA &&
+            *(uintptr_t*)(lh + LUA_G_OFF) == G &&
+            *(uintptr_t*)(lh + LUA_STACK_OFF) >= 0x100000000ULL &&
+            *(uintptr_t*)(lh + LUA_STACK_OFF) <= 0x16000000000ULL) {
+            mt = thread_L;
+        }
+        if (!mt) {
+            snprintf(buf, len, "ERR: G=%p mainthread %#lx invalid and thread %#lx invalid",
+                     (void*)G, (unsigned long)mt, (unsigned long)thread_L);
+            return -1;
+        }
     }
     g_main_L = mt;
     g_main_G = G;

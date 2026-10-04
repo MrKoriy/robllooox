@@ -886,3 +886,95 @@ local x = "cap" return (function() return x end)() -- ✓ "cap"
 - /tmp/handler_callees.json — BL-цели хендлеров
 - /tmp/rbx741_disasm.txt — полный дизассембл (851МБ)
 - /tmp/flyremap.py, /tmp/fly8.lua — заготовка флая
+
+# СЕССИЯ 2026-10-05 (финал, 03:00) — РАННЕР ПОЧИНЕН, ВСЕЛЕННЫЕ, IDENTITY
+
+## ГЛАВНОЕ: РАННЕР РАБОТАЕТ (корневые баги найдены и устранены)
+1. **count=0 у раннера**: func TValue = co->top - (count+1)*16. Замыкание после
+   luau_load лежит на top-1 → count ДОЛЖЕН быть 0 (было 1 → читал слот ПОД
+   замыканием). `print("X")` → pcall=0 + результат + вывод в клиент ✓.
+2. **Identity-копия +0x40..0xc0 ЛОМАЛА top/base/ci** → «attempt to call a table».
+   Удалена полностью (осталась только безопасная ExtraSpace-копия co-0x18).
+3. Пре-чек раннера 0x1026e8e88 ПРИНИМАЕТ свежие co: status==0 && [co+0x50]==[co+0x58]
+   (ci==base_ci, верно для lua_newthread), from=NULL явно поддержан (nCcalls=1).
+4. luaD_call = **0x10270af04**(L, func_TValue, nresults): ci={base@0,func@8,
+   top@0x10,savedpc@0x18,pc@0x20,nresults@0x28,flags@0x2c}, ci->base=func+16,
+   нативы читают аргументы с func+16 (=RA+1) — СТАНДАРТ.
+5. Всё под защитой rawrunprotected 0x1026e8250 (ошибки не роняют клиент).
+
+## РАБОТАЕТ СЕЙЧАС (BC: pipeline, компиляция+ремап+исполнение)
+```lua
+print("...")                                  -- вывод в FLog::CreatorOutput
+return game.Name                              -- "LuaApp" (меню) / "Ugc" (игра)
+return game.ClassName                         -- "DataModel"
+local rs = game.RunService return rs.ClassName -- "RunService"
+local ws = game:GetService("Workspace") return ws.Name  -- "Workspace" (namecall!)
+local f = function(a) return a end return f("AAA")      -- Lua-замыкания: args+ret ✓
+local x = Vector3.new(1,2,3) return x.Y                   -- fastcall-встроенные ✓
+```
+
+## ЛОАДЕР КЛИЕНТА ПЕРЕНОМЕРОВЫВАЕТ ОПКОДЫ (wire→internal, PROTODUMP-verified)
+Замыкание → [cl+0x18]=proto → [proto+0x50]=code. Дамп ПОСЛЕ luau_load:
+- PREPVARARGS: 82→62, MOVE: 144→189, DUPCLOSURE: 192→134, CALL: 159→170,
+  LOADK: 111→207, RETURN: 130→146, NAMECALL: 95→132, GETIMPORT: 164→23(+патч aux!)
+- Рантайм-таблица диспатча = 0x106a31bd0 (91+ слотов, internal numbering),
+  интерпретер: `ldrb op,[pc]; ldr h,[table+op*8]; br h` @ 0x102706664.
+- Import id формат: count<<30 | id0<<20 | id1<<10 | id2 (10-бит поля).
+- «Зеркальная» таблица 0x106a39bd0 — НЕ диспатч (C++ объекты).
+
+## NAMECALL-ПРОТОКОЛ (0.741)
+- **tt=9 + зарегистрированный тег** (Instances: game, Workspace, RunService) →
+  FAST path: R[A]:=транспарент из G[tag*72+0x960], R[A+1]:=РЕСИВЕР,
+  [L+8]:=ключ-строка. Работает ИДЕАЛЬНО: GetService("Workspace").Name ✓.
+- **События (Heartbeat: tt=9, но тег НЕ зарегистрирован / флаг [G+tag*72+0x92c]=0)**
+  → SLOW path → пишет КЛЮЧ-СТРОКУ в RA+1 (слот ресивера!) → Connect получает
+  "Connect"(string) как arg#1 → «RBXScriptSignal expected, got string».
+- Прямой вызов натива (GETTABLEKS+CALL): аргументы читаются с RA+2 (сдвиг +1):
+  `hb.Connect(hb, fn)` → Connect видит (fn) как arg1 → «got function».
+- Lua-замыкания: вызовы/аргументы/возвраты ПОЛНОСТЬЮ стандартные (RA+1).
+
+## ВСЕЛЕННЫЕ (меню vs игра) + __SETMAIN__
+- Меню: game.Name="LuaApp" — САМАЯ популярная G среди кандидатов.
+- Игра (place 1818): game.Name="Ugc" — ВТОРАЯ по популярности G.
+- __SETMAIN__ <L> + ослабленная валидация (не mainthread, а «живой поток с G») —
+  работает: lua_newthread-родителю нужен только правильный G.
+- confirmed_main_thread: мягкая валидация кэша + ПРЕДПОЧТЕНИЕ запомненной
+  g_main_G при перелоке (игровая корутина умирает → не сваливаемся в меню).
+- __CANDS__ (новая IPC-команда): список кандидатов L/G/статус.
+- Скан: G-диверсификация (cap 200 на G), дедлайн 45с, регионы только ascending
+  (descending-обход через mach_vm_region сверху НЕ ДОХОДИТ до malloc-кучи).
+
+## IDENTITY / CAPABILITIES (последний незакрытый пункт)
+- `game.Players.LocalPlayer.Character` → «The current thread cannot read
+  'Character' (lacking capability Players)» — ДАЖЕ в игровой вселенной
+  и ДАЖЕ с принудительной записью identity=7 + caps=~0 в ExtraSpace(co-0x18)
+  и в shared-блок. → чек читает identity НЕ из ExtraSpace.
+- Гипотеза на след. сессию: **RBX-врапер треда [L+0x48] → [+0x90]** (из
+  lua_pushthread-хвоста старой сессии) — скопировать врапер-указатель [co+0x48]
+  с игрового main (БЕЗ +0x50..+0x88 — они ломают ci/top!).
+- Найденные игровые корутины (G=gameG) — в основном внутренние (строки
+  «AbilityStatus»/«AndroPudio» в L-0x18 = нет ExtraSpace) — нужны НАСТОЯЩИЕ
+  скриптовые корутины (status=1, припаркованные планировщиком).
+
+## УСТОЙЧИВОСТЬ
+- IPC-поток клиннится после ~5-10 тяжёлых exec/скан-циклов (клиент жив, сокет
+  молчит) — рестарт клиента лечит. exec внутри вызывает confirmed_main_thread
+  → полный heap-скан (45с) на каждый BC: при протухшем кэше = клин.
+- Клиент деградирует после ~30 краш-проб (g.ClassName ломается) — рестарт.
+
+## Команды воспроизведения
+```bash
+./build.sh && (клиент: RobloxPlayer &) && ./live_inject.sh RobloxPlayer
+open "roblox://experiences/start?placeId=1818"; sleep 45
+printf '__SCANL__\n' | nc -U /tmp/inj_ipc_501.sock        # скан
+printf '__CANDS__\n' | nc -U /tmp/inj_ipc_501.sock        # кандидаты
+printf '__SETMAIN__ <game-L>\n' | nc -U /tmp/inj_ipc_501.sock
+python3: quick.py run_bc(remap(compile_src(src), MAP))    # MAP из KNOWN + {20:95, 64:192}
+```
+
+## СЛЕДУЮЩИЙ ШАГ (короткий)
+1. [co+0x48] = [game-main+0x48] (врапер) + повторить Character-тест.
+2. Если нет — найти в дизассембле геттер identity (кто читает «current thread»
+   в CheckCapabilities) и скопировать ИСТОЧНИК.
+3. fly: `root:ApplyImpulse(Vector3.new(0,300,0))` — namecall на Instance (tt=9,
+   как GetService) — заработает сразу после identity.
