@@ -2245,6 +2245,13 @@ static void find_live_thread(void) {
                         for (int q = 0; q < g_live_n; q++)
                             if (g_live_L[q] == L) { dup = 1; break; }
                         if (dup) continue;
+                        /* status sanity: valid thread statuses are 0..6 and
+                         * 0x7f — the st=75/20/16 "threads" are heap garbage
+                         * that monopolize the candidate list */
+                        {
+                            uint8_t stt = chunk[i + LUA_STATUS_OFF];
+                            if (stt > 6 && stt != 0x7f) continue;
+                        }
                         /* weak-path budget: reserve half the slots for the
                          * fully-validated (final-path) candidates so the
                          * garbage-G tt9 hits can't monopolize the list */

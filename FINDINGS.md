@@ -999,3 +999,36 @@ python3: quick.py run_bc(remap(compile_src(src), MAP))    # MAP из KNOWN + {20
   б) поиск игровых корутин через узлы планировщика (__BACKREF__ на G);
   в) найти identity-геттер в дизассембле (кто читает «current thread» для
      capability-чека) — врапер [L+0x48]→[+0x90] или ScriptContext-цепочка.
+
+# ФИНАЛ-2 (2026-10-06 01:35) — ЦЕПЬ ФЛАЯ ПРОВЕРЕНА В ИГРЕ ✓
+**Рабочая цепь (в игровой вселенной, проверено живьём):**
+```lua
+local nm   = game.Players.LocalPlayer.Name          -- "silov801" ✓
+local ch   = game.Workspace:FindFirstChild(nm)      -- Model ✓ (namecall на Instance!)
+local root = ch.HumanoidRootPart                    -- Part ✓
+```
+— **Capability-чек обойдён через Workspace-маршрут** (не трогаем
+LocalPlayer.Character напрямую!).
+— Остался последний шаг: `root:ApplyImpulse(Vector3.new(0,300,0))` —
+namecall на Instance (тот же протокол, что рабочий FindFirstChild!) +
+Vector3.new (fastcall, работал standalone). Не дошли из-за нестабильности
+клиента (см. ниже).
+
+## Скан-фиксы этой сессии
+- **Статус-фильтр слабого пути**: st>6 && st!=0x7f = мусор (st=75/20/16
+  забивали слоты) — теперь чисто.
+- Weak-path кап 256; слайс-проходы; диапазон 0x74000000000.
+- ВАЖНО: повторный join в том же процессе = краш клиента (один join на
+  инжект-сессию!).
+- **WATCHDOG-рескан внутри exec дестабилизирует клиент** (150с скан на каждый
+  BC: при протухшем main) — выключить/ограничить в след. сессии.
+- Деградация после ~6-10 проб за сессию (рестарт лечит).
+
+## Точная процедура запуска флая (след. сессия, 6 проб максимум)
+1. `pkill RobloxPlayer; запустить; live_inject; open placeId=1818; sleep 70`
+2. `__SCANL__` + `__CANDS__` (один раз!)
+3. Проба G: SETMAIN 2й-G → `return game.Name` → «Ugc» = игра
+4. `chain`-тест (root.ClassName = "Part") — валидация
+5. **Импульс**: `root:ApplyImpulse(Vector3.new(0,300,0))`
+6. Флай-луп из python: цикл BC:-импульсов 10-15 Гц (пока без Connect —
+   события через slow-namecall ломают аргументы; задокументировано).
