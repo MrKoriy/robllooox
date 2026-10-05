@@ -327,6 +327,13 @@ static uintptr_t find_ptr_in_sections(const section_range* secs, int nsecs,
  * We discover both offsets empirically — version-agnostic, no hardcoding. */
 /* Validate a global_State pointer by locating its string table
  * {hash*, size, nuse} with TString-shaped entries. Offset-agnostic. */
+/* heap pointer validity: the client maps the lua heap either in the
+ * 0x10-0x15x range OR in the 0x71x range depending on launch; the game
+ * universe's heap specifically lands high (0x70-0x73x). */
+static inline bool heap_ptr_ok(uint64_t p) {
+    return p >= 0x100000000ULL && p < 0x74000000000ULL;
+}
+
 static int g_strt_ok(uintptr_t g) {
     static uintptr_t ok_cache[64];
     static uint8_t   ok_val[64];
@@ -338,7 +345,7 @@ static int g_strt_ok(uintptr_t g) {
     if (safe_read(g, gb, sizeof(gb))) {
         for (int off = 0; off + 16 <= 0x440 && !ok; off += 8) {
             uintptr_t bucket = *(uintptr_t*)(gb + off) & PTR_MASK;
-            if (bucket < 0x100000000ULL || bucket > 0x16000000000ULL || (bucket & 7))
+            if (bucket < 0x100000000ULL || bucket > 0x74000000000ULL || (bucket & 7))
                 continue;
             uint64_t size = *(uint32_t*)(gb + off + 8);
             uint64_t nuse = *(uint32_t*)(gb + off + 12);
@@ -350,7 +357,7 @@ static int g_strt_ok(uintptr_t g) {
             for (int k = 0; k < 16; k++) {
                 if (bs[k] == 0) continue;
                 uintptr_t s = bs[k] & PTR_MASK;
-                if (s < 0x100000000ULL || s > 0x16000000000ULL || (s & 7)) { bad = 1; break; }
+                if (s < 0x100000000ULL || s > 0x74000000000ULL || (s & 7)) { bad = 1; break; }
                 uint8_t sb[0x18];
                 if (!safe_read(s, sb, sizeof(sb))) { bad = 1; break; }
                 uint32_t slen = *(uint32_t*)(sb + 0x14);
@@ -391,7 +398,7 @@ static bool lua_thread_magic_ok(uintptr_t L) {
 
 static bool looks_like_lua_state_safe(uintptr_t candidate) {
     if (candidate == 0 || (candidate % 8) != 0) return false;
-    if (candidate < 0x100000000ULL || candidate > 0x16000000000ULL) return false;
+    if (candidate < 0x100000000ULL || candidate > 0x74000000000ULL) return false;
 
     uint8_t buf[0x88];
     if (!safe_read(candidate, buf, sizeof(buf))) return false;
@@ -401,7 +408,7 @@ static bool looks_like_lua_state_safe(uintptr_t candidate) {
 
     uintptr_t cand_masked = candidate & PTR_MASK;
     uintptr_t g = *(uintptr_t*)(buf + LUA_G_OFF) & PTR_MASK;
-    if (g < 0x100000000ULL || g > 0x16000000000ULL || (g & 0xF) != 0) return false;
+    if (g < 0x100000000ULL || g > 0x74000000000ULL || (g & 0xF) != 0) return false;
     uintptr_t dist = (g > cand_masked) ? (g - cand_masked) : (cand_masked - g);
     if (dist < 0x60) return false;
     if (!lua_thread_magic_ok(candidate)) return false;
@@ -505,13 +512,13 @@ static int collect_lua_candidates(uintptr_t region_addr, mach_vm_size_t region_s
             if (magic != ((uint32_t)((cand + LUA_MAGIC_OFF) & 0xffffffffULL) ^ 0x2du))
                 continue;                                /* anti-forgery */
             uintptr_t gg = *(uintptr_t*)(buf + i + LUA_G_OFF) & PTR_MASK;
-            if (gg < 0x100000000ULL || gg > 0x16000000000ULL || (gg & 0xF)) continue;
+            if (gg < 0x100000000ULL || gg > 0x74000000000ULL || (gg & 0xF)) continue;
             uintptr_t candidate = region_addr + off + i;
             out[n].addr = candidate;
             out[n].nptrs = 0;
             for (uintptr_t goff = 0x10; goff <= 0x48 && out[n].nptrs < 4; goff += 8) {
                 uintptr_t p = *(uintptr_t*)(buf + i + goff) & PTR_MASK;
-                if (p < 0x100000000ULL || p > 0x16000000000ULL) continue;
+                if (p < 0x100000000ULL || p > 0x74000000000ULL) continue;
                 if (p == (candidate & PTR_MASK)) continue;
                 out[n].ptrs[out[n].nptrs++] = p;
             }
@@ -567,7 +574,7 @@ extern "C" int executor_sc_dump(char* buf, size_t len) {
         if (!safe_read(sc, chunk, sizeof(chunk))) continue;
         for (uintptr_t o = 0; o + 8 <= sizeof(chunk) && off + 128 < len; o += 8) {
             uintptr_t v = *(uintptr_t*)(chunk + o);
-            bool heap = v >= 0x100000000ULL && v <= 0x16000000000ULL && v % 8 == 0;
+            bool heap = v >= 0x100000000ULL && v <= 0x74000000000ULL && v % 8 == 0;
             if (!heap) continue; /* skip scalars, print pointer fields only */
             uint8_t hdr[0x18];
             safe_read(v, hdr, sizeof(hdr));
@@ -909,7 +916,7 @@ static void* hunter_thread(void* arg) {
         bool verified = false;
         for (uintptr_t off = 0; off + 8 <= sizeof(chunk); off += 8) {
             uintptr_t v = *(uintptr_t*)(chunk + off);
-            if (v < 0x100000000ULL || v > 0x16000000000ULL) continue;
+            if (v < 0x100000000ULL || v > 0x74000000000ULL) continue;
             /* log every in-range pointer candidate with its g/stack/top fields */
             {
                 uint8_t q[0x88];
@@ -918,7 +925,7 @@ static void* hunter_thread(void* arg) {
                     uintptr_t vstk = *(uintptr_t*)(q + LUA_STACK_OFF);
                     uintptr_t vtop = *(uintptr_t*)(q + LUA_TOP_OFF);
                     static int dbg_probe = 0;
-                    if (vg >= 0x100000000ULL && vg <= 0x16000000000ULL && dbg_probe < 60) {
+                    if (vg >= 0x100000000ULL && vg <= 0x74000000000ULL && dbg_probe < 60) {
                         dbg_probe++;
                         LOG_CORE("  +0x%03lx -> %p b1=%02x g=%#llx stk=%#llx top=%#llx",
                                  (unsigned long)off, (void*)v, q[LUA_TT_OFF],
@@ -1146,7 +1153,7 @@ extern "C" void hook_check(uintptr_t x0, uintptr_t x1, uintptr_t slot_idx) {
     uintptr_t cands[2] = { x1, x0 }; /* arg first, then this */
     for (int i = 0; i < 2; i++) {
         uintptr_t c = cands[i];
-        if (c < 0x100000000ULL || c > 0x16000000000ULL) continue;
+        if (c < 0x100000000ULL || c > 0x74000000000ULL) continue;
         if ((c % 8) != 0) continue;
 
         uint8_t buf[0x50];
@@ -1248,7 +1255,7 @@ extern "C" int executor_vtable_lab(char* buf, size_t len) {
         uintptr_t v = 0;
         if (!safe_read(slot, &v, 8)) break;
         uintptr_t masked = v & PTR_MASK;
-        if (masked < 0x100000000ULL || masked > 0x16000000000ULL) {
+        if (masked < 0x100000000ULL || masked > 0x74000000000ULL) {
             if (nslots > 0) break; /* data after code slots */
             continue;
         }
@@ -1786,6 +1793,7 @@ static void find_live_thread(void) {
     int coro_stored = 0;
     uintptr_t gbest = 0;
     int bestn = 0;
+    int weak_stored = 0; /* weak-path (tt9 CAND+) budget: cap at 256 */
     /* scan wall-clock baseline shared by the pass and region-loop checks */
     static mach_timebase_info_data_t tb_s;
     static int tb_s_init = 0;
@@ -1797,7 +1805,7 @@ static void find_live_thread(void) {
             uint64_t now = mach_absolute_time();
             double elapsed = (double)(now - scan_t0) * (double)tb_s.numer /
                              ((double)tb_s.denom * 1e9);
-            if (elapsed > 45.0) {
+            if (elapsed > 150.0) {
                 LOG_CORE("EXEC: scan deadline hit (%.1fs) — stopping", elapsed);
                 break;
             }
@@ -1813,11 +1821,11 @@ static void find_live_thread(void) {
             int stored_mains = 0;
             for (int q = 0; q < g_coro_n && stored_mains < 8; q++) {
                 uintptr_t gb2 = g_coro_G[q];
-                if (gb2 < 0x100000000ULL || gb2 > 0x16000000000ULL || (gb2 & 0xF) != 0)
+                if (gb2 < 0x100000000ULL || gb2 > 0x74000000000ULL || (gb2 & 0xF) != 0)
                     continue;
                 uintptr_t mt = 0;
                 safe_read(gb2 + 0x90, &mt, 8);
-                if (mt < 0x100000000ULL || mt > 0x16000000000ULL || (mt & 0xF) != 0) {
+                if (mt < 0x100000000ULL || mt > 0x74000000000ULL || (mt & 0xF) != 0) {
                     LOG_CORE("EXEC: u=%d g=%p bad mt=%#llx", q, (void*)gb2,
                              (unsigned long long)mt);
                     continue;
@@ -1849,8 +1857,8 @@ static void find_live_thread(void) {
                     safe_read(mt + 0x50, &mci, 8);
                     if ((mtop >> 56) == 0xca)
                         mtop = ((mtop >> 32) & 0xffffff) << 32 | (mtop & 0xffffffff);
-                    if (mstk >= 0x100000000ULL && mstk <= 0x16000000000ULL &&
-                        mtop >= mstk && mtop <= 0x16000000000ULL &&
+                    if (mstk >= 0x100000000ULL && mstk <= 0x74000000000ULL &&
+                        mtop >= mstk && mtop <= 0x74000000000ULL &&
                         (mtop - mstk) <= 0x400000ULL) {
                         g_live_L[g_live_n] = mt;
                         g_live_ss[g_live_n] = mci;
@@ -1871,8 +1879,14 @@ static void find_live_thread(void) {
         uint32_t c_tt9 = 0, c_g = 0;
         uint32_t c_ptr = 0, c_d = 0, c_span = 0, c_gread = 0, c_gsize = 0, c_final = 0;
         /* ascending walk (descending probes never reach the malloc heap
-         * through the read-only mappings at the top of the space) */
-        mach_vm_address_t addr = 0;
+         * through the read-only mappings at the top of the space).
+         * Each pass covers a DIFFERENT slice of the address space so the
+         * 8 passes together cover the whole heap within the deadline. */
+        const uint64_t span_lo = 0x100000000ULL;
+        const uint64_t span_hi = 0x74000000000ULL;
+        const uint64_t step = (span_hi - span_lo) / 8;
+        mach_vm_address_t addr = span_lo + (uint64_t)pass * step;
+        mach_vm_address_t addr_hi = (pass < 7) ? (addr + step) : span_hi;
         mach_vm_size_t size = 0;
         while (1) {
             mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
@@ -1883,7 +1897,7 @@ static void find_live_thread(void) {
                                               (vm_region_info_t)&info, &cnt, &object_name);
             if (kr != KERN_SUCCESS) break;
             if (!(info.protection & VM_PROT_READ) || !(info.protection & VM_PROT_WRITE) ||
-                addr < 0x100000000ULL || addr >= 0x16000000000ULL ||
+                addr < 0x100000000ULL || addr >= 0x74000000000ULL ||
                 size < 0x4000 || size >= 0x80000000ULL) {
                 addr += size;
                 continue;
@@ -1898,7 +1912,7 @@ static void find_live_thread(void) {
                         uint64_t now2 = mach_absolute_time();
                         double el2 = (double)(now2 - scan_t0) * (double)tb_s.numer /
                                      ((double)tb_s.denom * 1e9);
-                        if (el2 > 50.0) {
+                        if (el2 > 155.0) {
                             LOG_CORE("EXEC: region-loop deadline (%.1fs) — aborting scan", el2);
                             free(chunk);
                             goto scan_done;
@@ -1925,10 +1939,10 @@ static void find_live_thread(void) {
                         uintptr_t top = *(uintptr_t*)(chunk + i + LUA_TOP_OFF);
                         if ((top >> 56) == 0xca)
                             top = ((top >> 32) & 0xffffff) << 32 | (top & 0xffffffff);
-                        if (g < 0x100000000ULL || g > 0x16000000000ULL) continue;
-                        if (stk < 0x100000000ULL || stk > 0x16000000000ULL) continue;
-                        if (lci < 0x100000000ULL || lci > 0x16000000000ULL) continue;
-                        if (top < 0x100000000ULL || top > 0x16000000000ULL) continue;
+                        if (g < 0x100000000ULL || g > 0x74000000000ULL) continue;
+                        if (stk < 0x100000000ULL || stk > 0x74000000000ULL) continue;
+                        if (lci < 0x100000000ULL || lci > 0x74000000000ULL) continue;
+                        if (top < 0x100000000ULL || top > 0x74000000000ULL) continue;
                         if ((g & 0xF) != 0) continue;
                         c_ptr++;
                         /* reference scan: qwords pointing at known threads;
@@ -1957,7 +1971,7 @@ static void find_live_thread(void) {
                                 pri += 16;
                             uintptr_t blk = *(uintptr_t*)(chunk + i + LUA_STACK_OFF);
                             uintptr_t lim = *(uintptr_t*)(chunk + i + LUA_SLAST_OFF);
-                            if (blk >= 0x100000000ULL && blk <= 0x16000000000ULL &&
+                            if (blk >= 0x100000000ULL && blk <= 0x74000000000ULL &&
                                 lim > blk && lim - blk <= 0x100000ULL) {
                                 pri += 8;
                                 if (*(uintptr_t*)(chunk + i + LUA_INNER_OFF) ==
@@ -1970,7 +1984,7 @@ static void find_live_thread(void) {
                                          top - stk <= 0x400000ULL &&
                                          ((top - stk) & 0xF) == 0 &&
                                          blk >= 0x100000000ULL &&
-                                         blk <= 0x16000000000ULL;
+                                         blk <= 0x74000000000ULL;
                             if (top_ok) {
                                 if (g_strt_ok(g)) pri += 20;
                                 c_final++;
@@ -2026,11 +2040,11 @@ static void find_live_thread(void) {
                             uintptr_t c_cil = *(uintptr_t*)(chunk + i + LUA_TOP_OFF);
                             uintptr_t c_cib = *(uintptr_t*)(chunk + i + LUA_BASE_OFF);
                             uintptr_t c_ina = *(uintptr_t*)(chunk + i + LUA_INNER_OFF);
-                            if (c_sa >= 0x100000000ULL && c_sa <= 0x16000000000ULL &&
+                            if (c_sa >= 0x100000000ULL && c_sa <= 0x74000000000ULL &&
                                 c_stk == c_sa && c_sl == c_sa + 0x280 &&
                                 top == c_sa + 0x10 && c_cil == c_sa + 0x10 &&
                                 c_cib == c_sa + 0x10 && c_ina == lci &&
-                                lci >= 0x100000000ULL && lci <= 0x16000000000ULL) {
+                                lci >= 0x100000000ULL && lci <= 0x74000000000ULL) {
                                 int seen = -1;
                                 for (int q = 0; q < g_coro_n; q++)
                                     if (g_coro_G[q] == g) { seen = q; break; }
@@ -2120,18 +2134,18 @@ static void find_live_thread(void) {
                         uintptr_t cil = *(uintptr_t*)(chunk + i + 0x60);
                         uintptr_t cib = *(uintptr_t*)(chunk + i + 0x68);
                         if (sa != 0) {
-                            if (sa < 0x100000000ULL || sa > 0x16000000000ULL) continue;
+                            if (sa < 0x100000000ULL || sa > 0x74000000000ULL) continue;
                             if (sa > stk || stk - sa > 0x100000ULL) continue;
                         }
                         if (sl != 0) {
-                            if (sl < 0x100000000ULL || sl > 0x16000000000ULL) continue;
+                            if (sl < 0x100000000ULL || sl > 0x74000000000ULL) continue;
                             /* Luau extra stack space: reference 47061 had top =
                              * stack_last + 0x4d0; allow generous margin */
                             if (top > sl + 0x1000ULL || sl - stk > 0x100000ULL) continue;
                         }
                         if (cil != 0 && cib != 0) {
-                            if (cil < 0x100000000ULL || cil > 0x16000000000ULL) continue;
-                            if (cib < 0x100000000ULL || cib > 0x16000000000ULL) continue;
+                            if (cil < 0x100000000ULL || cil > 0x74000000000ULL) continue;
+                            if (cib < 0x100000000ULL || cib > 0x74000000000ULL) continue;
                             if (cib > lci || lci > cil || cil - cib > 0x40000ULL) continue;
                         }
                         c_span++;
@@ -2166,7 +2180,7 @@ static void find_live_thread(void) {
                             uint64_t gv[2] = {0, 0};
                             if (!safe_read(g, gv, 16)) continue;
                             uintptr_t gb = gv[0];
-                            if (gb < 0x100000000ULL || gb > 0x16000000000ULL) continue;
+                            if (gb < 0x100000000ULL || gb > 0x74000000000ULL) continue;
                             uint64_t gsize = gv[1] & 0xffffffffULL;
                             uint64_t gnuse = gv[1] >> 32;
                             c_gread++;
@@ -2186,7 +2200,7 @@ static void find_live_thread(void) {
                             int bad = 0;
                             for (int k = 0; k < 64; k++) {
                                 if (bs[k] == 0) continue;
-                                if (bs[k] < 0x100000000ULL || bs[k] > 0x16000000000ULL ||
+                                if (bs[k] < 0x100000000ULL || bs[k] > 0x74000000000ULL ||
                                     (bs[k] & 7) != 0) {
                                     bad = 1;
                                     break;
@@ -2203,7 +2217,7 @@ static void find_live_thread(void) {
                                     break;
                                 }
                                 if (snext != 0 && (snext < 0x100000000ULL ||
-                                                   snext > 0x16000000000ULL)) {
+                                                   snext > 0x74000000000ULL)) {
                                     bad = 1;
                                     break;
                                 }
@@ -2231,6 +2245,10 @@ static void find_live_thread(void) {
                         for (int q = 0; q < g_live_n; q++)
                             if (g_live_L[q] == L) { dup = 1; break; }
                         if (dup) continue;
+                        /* weak-path budget: reserve half the slots for the
+                         * fully-validated (final-path) candidates so the
+                         * garbage-G tt9 hits can't monopolize the list */
+                        if (weak_stored >= 256) continue;
                         if (g_live_n < MAX_LIVE_CANDS) {
                             int cand_pri = 0;
                             if (chunk[i] == 0xA) cand_pri += 4;   /* LUA_TTHREAD per newthread */
@@ -2247,12 +2265,14 @@ static void find_live_thread(void) {
                                      (void*)stk, (void*)top, cand_pri);
                             if (g_live_n < 24) g_tt9_cands[g_live_n] = L;
                             g_live_n++;
+                            weak_stored++;
                         }
                     }
                     done += got;
                 }
                 free(chunk);
             addr += size;
+            if (addr >= addr_hi) break; /* this pass's slice done */
         }
         LOG_CORE("EXEC: pass %d done tt9=%u ptr=%u d=%u span=%u gread=%u gsize=%u final=%u stored=%d",
                  pass, c_tt9, c_ptr, c_d, c_span, c_gread, c_gsize, c_final, g_live_n);
@@ -2379,21 +2399,21 @@ static int executor_hook_pcall(uintptr_t fn) {
 }
 
 static bool lua_state_usable(uintptr_t L) {
-    if (L < 0x100000000ULL || L > 0x16000000000ULL) return false;
+    if (L < 0x100000000ULL || L > 0x74000000000ULL) return false;
     if ((L & 0xF) != 0) return false;
     uint8_t lh[0x88];
     if (!safe_read(L, lh, sizeof(lh))) return false;
     if (lh[LUA_TT_OFF] != 0xA) return false;   /* tt @ +1 (0.741) */
     uintptr_t g = *(uintptr_t*)(lh + LUA_G_OFF);
-    if (g < 0x100000000ULL || g > 0x16000000000ULL) return false;
+    if (g < 0x100000000ULL || g > 0x74000000000ULL) return false;
     if ((g & 0xF) != 0) return false;
     if (!g_strt_ok(g)) return false;
     uintptr_t stack = *(uintptr_t*)(lh + LUA_STACK_OFF);
     uintptr_t top = *(uintptr_t*)(lh + LUA_TOP_OFF);
-    if (stack < 0x100000000ULL || stack > 0x16000000000ULL) return false;
+    if (stack < 0x100000000ULL || stack > 0x74000000000ULL) return false;
     if ((top >> 56) == 0xca)
         top = ((top >> 32) & 0xffffff) << 32 | (top & 0xffffffff);
-    if (top < stack || top > 0x16000000000ULL) return false;
+    if (top < stack || top > 0x74000000000ULL) return false;
     if ((top - stack) > 0x400000ULL || ((top - stack) & 0xF) != 0) return false;
     return true;
 }
@@ -2528,13 +2548,13 @@ static int exec_gamestate_legacy(const char* code, char* out, size_t out_len) {
         uintptr_t Lg = *(uintptr_t*)(L + 0x48);   /* 0.739: L->G */
         uint64_t gchk[2] = {0, 0};
         uint8_t* gbuf = (uint8_t*)&gchk;
-        if (Lg >= 0x100000000ULL && Lg < 0x16000000000ULL && safe_read(Lg, gbuf, 16)) {
+        if (Lg >= 0x100000000ULL && Lg < 0x74000000000ULL && safe_read(Lg, gbuf, 16)) {
             uintptr_t gbucket = gchk[0];
             uint32_t gbsize = (uint32_t)(gchk[1] & 0xffffffffULL);
             uint32_t gcnt = (uint32_t)(gchk[1] >> 32);
             LOG_CORE("EXEC: G=%p bucket=%p bsize=%u cnt=%u", (void*)Lg, (void*)gbucket,
                      gbsize, gcnt);
-            if (gbucket < 0x100000000ULL || gbucket > 0x16000000000ULL) {
+            if (gbucket < 0x100000000ULL || gbucket > 0x74000000000ULL) {
                 snprintf(out + n, out_len - n, "ERR: bad bucket at G (cand skip)\n");
                 continue;
             }
@@ -2562,11 +2582,11 @@ static int exec_gamestate_legacy(const char* code, char* out, size_t out_len) {
     if ((tp >> 56) == 0xca) {
         top_abs = ((tp >> 32) & 0xffffff) << 32 | (tp & 0xffffffff);
         n += snprintf(out + n, out_len - n, "top unpacked: %#lx\n", top_abs);
-    } else if (tp >= 0x100000000ULL && tp < 0x16000000000ULL && (tp & 7) == 0) {
+    } else if (tp >= 0x100000000ULL && tp < 0x74000000000ULL && (tp & 7) == 0) {
         top_abs = tp;
     }
     if (!top_abs || (stack && (top_abs < stack || top_abs - stack > 0x400000ULL))) {
-        if (stack && stack >= 0x100000000ULL && stack < 0x16000000000ULL && is_memory_writable(stack)) {
+        if (stack && stack >= 0x100000000ULL && stack < 0x74000000000ULL && is_memory_writable(stack)) {
             tp = stack;
             top_abs = stack;
             LOG_CORE("EXEC: empty stack, using top=stack %#lx", stack);
@@ -2638,7 +2658,7 @@ static int exec_gamestate_legacy(const char* code, char* out, size_t out_len) {
     }
     LOG_CORE("EXEC: intern -> %p", (void*)str_obj);
     n += snprintf(out + n, out_len - n, "intern=%#lx len=%zu\n", str_obj, len);
-    if (!str_obj || str_obj < 0x100000000ULL || str_obj > 0x16000000000ULL) {
+    if (!str_obj || str_obj < 0x100000000ULL || str_obj > 0x74000000000ULL) {
         snprintf(out + n, out_len - n, "ERR: intern failed");
         continue;
     }
@@ -2668,7 +2688,7 @@ static int exec_gamestate_legacy(const char* code, char* out, size_t out_len) {
     uintptr_t mt = 0;
     safe_read(Lg + 0x90, &mt, 8);
     int is_main = (mt == L);
-    if (!is_main || glue < 0x100000000ULL || glue > 0x16000000000ULL) {
+    if (!is_main || glue < 0x100000000ULL || glue > 0x74000000000ULL) {
         LOG_CORE("EXEC: SKIP L=%p glue=%#llx mt=%#llx pri=%d", (void*)L,
                  (unsigned long long)glue, (unsigned long long)mt, cand_pri);
         n += snprintf(out + n, out_len - n, "skip (glue=%#llx mt=%#llx)\n",
@@ -2751,7 +2771,7 @@ static int exec_gamestate_legacy(const char* code, char* out, size_t out_len) {
         LOG_CORE("EXEC: closure at top: val=%#llx tag=%#llx",
                  (unsigned long long)fv, (unsigned long long)ft);
         /* Roblox closures carry a continuation pointer at +0x28 */
-        if (fv >= 0x100000000ULL && fv <= 0x16000000000ULL) {
+        if (fv >= 0x100000000ULL && fv <= 0x74000000000ULL) {
             uint64_t c00 = 0, c08 = 0, c28 = 0, c30 = 0;
             safe_read(fv + 0x00, &c00, 8);
             safe_read(fv + 0x08, &c08, 8);
@@ -2803,7 +2823,7 @@ static int exec_gamestate_legacy(const char* code, char* out, size_t out_len) {
             }
             n += snprintf(out + n, out_len - n, "  [%d] @%#lx = %#llx tag=%#llx\n", i, slot,
                           (unsigned long long)v, (unsigned long long)t);
-            if (i == -1 && t == 6 && v >= 0x100000000ULL && v < 0x16000000000ULL) {
+            if (i == -1 && t == 6 && v >= 0x100000000ULL && v < 0x74000000000ULL) {
                 uint32_t slen = 0;
                 char sbuf[1025];
                 sbuf[0] = 0;
@@ -2861,14 +2881,14 @@ static uintptr_t unpack_top(uintptr_t tp) {
  * the parent's glue (on 0.741 the old +0x78 glue slot is the value
  * stack — it must not be touched). */
 static bool validate_main_thread(uintptr_t L) {
-    if (L < 0x100000000ULL || L > 0x16000000000ULL || (L & 0xF) != 0) return false;
+    if (L < 0x100000000ULL || L > 0x74000000000ULL || (L & 0xF) != 0) return false;
     uint8_t lh[0x88];
     if (!safe_read(L, lh, sizeof(lh))) return false;
     if (lh[LUA_TT_OFF] != 0xA) return false; /* tt @ +1 (0.741) */
     uintptr_t G = *(uintptr_t*)(lh + LUA_G_OFF);
-    if (G < 0x100000000ULL || G > 0x16000000000ULL || (G & 0xF) != 0) return false;
+    if (G < 0x100000000ULL || G > 0x74000000000ULL || (G & 0xF) != 0) return false;
     uintptr_t stack = *(uintptr_t*)(lh + LUA_STACK_OFF);
-    if (stack < 0x100000000ULL || stack > 0x16000000000ULL) return false;
+    if (stack < 0x100000000ULL || stack > 0x74000000000ULL) return false;
     /* anti-forgery magic written by stack_init on every thread */
     if (!lua_thread_magic_ok(L)) return false;
     /* G references its main thread; the slot moved between versions (0.739
@@ -2883,14 +2903,14 @@ static bool validate_main_thread(uintptr_t L) {
 /* Returns the live game main thread, running the full heap hunt only when
  * the cached pointer is missing or stale.why gets the failure reason. */
 static bool validate_usable_thread(uintptr_t L) {
-    if (L < 0x100000000ULL || L > 0x16000000000ULL || (L & 0xF) != 0) return false;
+    if (L < 0x100000000ULL || L > 0x74000000000ULL || (L & 0xF) != 0) return false;
     uint8_t lh[0x88];
     if (!safe_read(L, lh, sizeof(lh))) return false;
     if (lh[LUA_TT_OFF] != 0xA) return false;
     uintptr_t G = *(uintptr_t*)(lh + LUA_G_OFF);
-    if (G < 0x100000000ULL || G > 0x16000000000ULL || (G & 0xF) != 0) return false;
+    if (G < 0x100000000ULL || G > 0x74000000000ULL || (G & 0xF) != 0) return false;
     uintptr_t stack = *(uintptr_t*)(lh + LUA_STACK_OFF);
-    if (stack < 0x100000000ULL || stack > 0x16000000000ULL) return false;
+    if (stack < 0x100000000ULL || stack > 0x74000000000ULL) return false;
     if (!lua_thread_magic_ok(L)) return false;
     return true;
 }
@@ -2932,7 +2952,7 @@ static uintptr_t confirmed_main_thread(char* why, size_t why_len) {
         for (int i = 0; i < g_live_n; i++) {
             uintptr_t G = 0;
             if (!safe_read(g_live_L[i] + LUA_G_OFF, &G, 8)) continue;
-            if (G < 0x100000000ULL || G > 0x16000000000ULL || (G & 0xF) != 0) continue;
+            if (G < 0x100000000ULL || G > 0x74000000000ULL || (G & 0xF) != 0) continue;
             int found = -1;
             for (int q = 0; q < ngc; q++) if (gc_g[q] == G) { found = q; break; }
             if (found >= 0) gc_n[found]++;
@@ -3011,7 +3031,7 @@ static uintptr_t confirmed_main_thread(char* why, size_t why_len) {
             for (int i = 0; i < g_live_n && ngc < 64; i++) {
                 uintptr_t G = 0;
                 if (!safe_read(g_live_L[i] + LUA_G_OFF, &G, 8)) continue;
-                if (G < 0x100000000ULL || G > 0x16000000000ULL || (G & 0xF) != 0) continue;
+                if (G < 0x100000000ULL || G > 0x74000000000ULL || (G & 0xF) != 0) continue;
                 int found = -1;
                 for (int q = 0; q < ngc; q++)
                     if (gcount_g[q] == G) { found = q; break; }
@@ -3044,7 +3064,7 @@ static uintptr_t confirmed_main_thread(char* why, size_t why_len) {
                 bool scan = (info.protection & VM_PROT_READ) &&
                             (info.protection & VM_PROT_WRITE) &&
                             addr >= 0x100000000ULL &&
-                            addr < 0x16000000000ULL &&
+                            addr < 0x74000000000ULL &&
                             size >= 0x4000 && size < 0x80000000ULL;
                 if (scan) {
                     mach_vm_size_t done = 0;
@@ -3065,7 +3085,7 @@ static uintptr_t confirmed_main_thread(char* why, size_t why_len) {
                                 ((uint32_t)((c + LUA_MAGIC_OFF) & 0xffffffffULL) ^ 0x2du))
                                 continue;
                             uintptr_t G = *(uintptr_t*)(chunk + i + LUA_G_OFF);
-                            if (G < 0x100000000ULL || G > 0x16000000000ULL ||
+                            if (G < 0x100000000ULL || G > 0x74000000000ULL ||
                                 (G & 0xF) != 0)
                                 continue;
                             int dup = 0;
@@ -3139,7 +3159,7 @@ static uintptr_t confirmed_main_thread(char* why, size_t why_len) {
 /* Snapshot of a lua_State for the log: header bytes, G/stack/ci/top and
  * the two TValues below top (with string extraction). */
 static void log_thread_state(const char* tag, uintptr_t L) {
-    if (L < 0x100000000ULL || L > 0x16000000000ULL) return;
+    if (L < 0x100000000ULL || L > 0x74000000000ULL) return;
     uint8_t q[0x88];
     if (!safe_read(L, q, sizeof(q))) {
         LOG_CORE("%s: L=%p UNREADABLE", tag, (void*)L);
@@ -3162,7 +3182,7 @@ static void log_thread_state(const char* tag, uintptr_t L) {
         safe_read(slot, &v, 8);
         safe_read(slot + 0xc, &t, 4);
         LOG_CORE("%s:   slot[%d]=%#llx tt=%u", tag, i, (unsigned long long)v, t);
-        if (t == 6 && v >= 0x100000000ULL && v < 0x16000000000ULL) {
+        if (t == 6 && v >= 0x100000000ULL && v < 0x74000000000ULL) {
             uint32_t slen = 0;
             char sbuf[160];
             if (safe_read(v + 0x14, &slen, 4) && slen > 0 && slen < 150 &&
@@ -3199,11 +3219,11 @@ static uintptr_t exec_newthread(uintptr_t mainL) {
     }
     remove_alrm_guard(&old_alrm);
     remove_segv_guard(&sa, old_sa);
-    if (jv != 0 || co < 0x100000000ULL || co > 0x16000000000ULL) return 0;
+    if (jv != 0 || co < 0x100000000ULL || co > 0x74000000000ULL) return 0;
     /* lua_newthread pushed the thread TValue onto main's stack — restore
      * main's top so the parked main keeps its frame shape. */
     uintptr_t mtp = 0;
-    if (safe_read(mainL + LUA_TOP_OFF, &mtp, 8) && mtp >= 0x100000000ULL && mtp <= 0x16000000000ULL) {
+    if (safe_read(mainL + LUA_TOP_OFF, &mtp, 8) && mtp >= 0x100000000ULL && mtp <= 0x74000000000ULL) {
         if (is_memory_writable(mainL + LUA_TOP_OFF)) {
             if ((mtp >> 56) != 0xca && mtp >= 0x100000000ULL)
                 *(uintptr_t*)(mainL + LUA_TOP_OFF) = mtp - 0x10;
@@ -3339,7 +3359,7 @@ static int extract_top_string(uintptr_t L, char* out, size_t out_len) {
         uint32_t t = 0;
         safe_read(slot, &v, 8);
         safe_read(slot + 0xc, &t, 4);
-        if (t != 6 || v < 0x100000000ULL || v > 0x16000000000ULL) continue;
+        if (t != 6 || v < 0x100000000ULL || v > 0x74000000000ULL) continue;
         uint32_t slen = 0;
         if (!safe_read(v + 0x14, &slen, 4) || slen == 0 || slen > 600) continue;
         char sbuf[608];
@@ -3518,7 +3538,7 @@ extern "C" int executor_exec_gamestate(const char* code, char* out, size_t out_l
                          (unsigned long long)mgr);
             for (int m = 0; m < 2; m++) {
                 uintptr_t mp = *(uintptr_t*)(cont + m * 8) & PTR_MASK;
-                if (mp < 0x100000000ULL || mp > 0x16000000000ULL) continue;
+                if (mp < 0x100000000ULL || mp > 0x74000000000ULL) continue;
                 uint8_t mb[0x30];
                 if (!safe_read(mp, mb, sizeof(mb))) continue;
                 LOG_CORE("EXEC: member%d %p:", m, (void*)mp);
@@ -3543,7 +3563,7 @@ extern "C" int executor_exec_gamestate(const char* code, char* out, size_t out_l
         bc_len = bc_raw_len;
     } else if (rr == 0) {
         uintptr_t module = *(uintptr_t*)cont & PTR_MASK;
-        if (module < 0x100000000ULL || module > 0x16000000000ULL) {
+        if (module < 0x100000000ULL || module > 0x74000000000ULL) {
             n += snprintf(out + n, out_len - n,
                           "ERR: compile container has no module0 (%#llx)\n",
                           (unsigned long long)*(uintptr_t*)cont);
@@ -3570,7 +3590,7 @@ extern "C" int executor_exec_gamestate(const char* code, char* out, size_t out_l
         /* the data pointer must be a plain, readable heap pointer — PAC
          * signed or chained pointers here mean the layout guess is wrong */
         if (bc_data && (bc_data < (const char*)0x100000000ULL ||
-                        bc_data > (const char*)0x16000000000ULL)) {
+                        bc_data > (const char*)0x74000000000ULL)) {
             n += snprintf(out + n, out_len - n,
                           "ERR: module string data ptr invalid (%#llx, "
                           "size=%#zx sizebyte=%#x) — layout needs rework\n",
@@ -3695,7 +3715,7 @@ extern "C" int executor_exec_gamestate(const char* code, char* out, size_t out_l
         return -1;
     }
 
-    if (fv >= 0x100000000ULL && fv < 0x16000000000ULL) {
+    if (fv >= 0x100000000ULL && fv < 0x74000000000ULL) {
         uint64_t c[6] = {0, 0, 0, 0, 0, 0};
         safe_read(fv, c, sizeof(c));
         LOG_CORE("EXEC: closure obj %#llx: +0=%#llx +8=%#llx +10=%#llx +18=%#llx +20=%#llx +28=%#llx",
@@ -3728,32 +3748,29 @@ extern "C" int executor_exec_gamestate(const char* code, char* out, size_t out_l
             *(uintptr_t*)(co - 0x10) = before_main[1];
             *(uintptr_t*)(co - 0x08) = before_main[2];
             LOG_CORE("EXEC: extraspace copied from main");
-            /* ELEVATE: the copied identity often lacks game capabilities
-             * ("lacking capability Players") — force executor-level
-             * identity 7 with a broad capability mask on BOTH the co's
-             * ExtraSpace and the shared block. */
-            {
-                RobloxExtraSpace* es = (RobloxExtraSpace*)(co - 0x18);
-                es->identity = 7;
-                es->capabilities = ~0ULL;
-                if (es->shared && is_memory_writable((uintptr_t)es->shared)) {
-                    es->shared->identity = 7;
-                    es->shared->capabilities = ~0ULL;
-                    LOG_CORE("EXEC: identity elevated to 7 (shared=%p)",
-                             (void*)es->shared);
-                } else {
-                    LOG_CORE("EXEC: identity elevated to 7 (no shared block)");
-                }
-            }
-        }
     }
 
-    /* NOTE: do NOT copy lua_State fields +0x40..0xc0 from main here —
+    /* NOTE: do NOT copy lua_State fields +0x50..0x88 from main here —
      * that clobbers ci(+0x50)/base_ci(+0x58)/base(+0x60)/top(+0x70)/
      * stack(+0x78) of the fresh co, which the runner's pre-check and
      * func-slot computation depend on (was the "attempt to call a
-     * table" root cause). The ExtraSpace copy above (co-0x18) already
-     * carries identity for the natives. */
+     * table" root cause). The SAFE subset is the RBX thread wrapper
+     * pointer at +0x48 (lua_pushthread reads [L+0x48] -> [x+0x90] for
+     * the security context) — copy JUST that. */
+    {
+        uintptr_t wmain = 0, wco = 0;
+        safe_read(L + 0x48, &wmain, 8);
+        safe_read(co + 0x48, &wco, 8);
+        if (wmain >= 0x100000000ULL && wmain <= 0x74000000000ULL &&
+            is_memory_writable(co + 0x48)) {
+            *(uintptr_t*)(co + 0x48) = wmain;
+            LOG_CORE("EXEC: RBX wrapper copied: co+0x48 %#llx -> %#llx",
+                     (unsigned long long)wco, (unsigned long long)wmain);
+        } else {
+            LOG_CORE("EXEC: no RBX wrapper on main (=%#llx)", (unsigned long long)wmain);
+        }
+    }
+    } /* end extraspace/wrapper identity block */
 
     /* Frame protocol (disasm-verified): the runner computes
      *   arg = co->top - count*16
@@ -3805,6 +3822,7 @@ extern "C" int executor_exec_gamestate(const char* code, char* out, size_t out_l
 
 /* List the live candidates from the last heap scan (__CANDS__): address,
  * G, status — lets the operator pick a GAME-universe thread for __SETMAIN__. */
+
 extern "C" int executor_list_candidates(char* buf, size_t len) {
     int n = 0;
     n += snprintf(buf + n, len - n, "live=%d main=%p\n", g_live_n, (void*)g_main_L);
@@ -3842,7 +3860,7 @@ extern "C" int executor_diag(char* buf, size_t len) {
 extern "C" int executor_set_main(uintptr_t thread_L, char* buf, size_t len) {
     uintptr_t G = 0;
     if (!safe_read(thread_L + LUA_G_OFF, &G, 8) ||
-        G < 0x100000000ULL || G > 0x16000000000ULL || (G & 0xF) != 0) {
+        G < 0x100000000ULL || G > 0x74000000000ULL || (G & 0xF) != 0) {
         snprintf(buf, len, "ERR: %#lx has no sane G", (unsigned long)thread_L);
         return -1;
     }
@@ -3864,12 +3882,12 @@ extern "C" int executor_set_main(uintptr_t thread_L, char* buf, size_t len) {
          * coroutine is perfect). */
         mt = 0;
         uint8_t lh[0x88];
-        if (thread_L >= 0x100000000ULL && thread_L <= 0x16000000000ULL &&
+        if (thread_L >= 0x100000000ULL && thread_L <= 0x74000000000ULL &&
             !(thread_L & 0xF) && safe_read(thread_L, lh, sizeof(lh)) &&
             lh[LUA_TT_OFF] == 0xA &&
             *(uintptr_t*)(lh + LUA_G_OFF) == G &&
             *(uintptr_t*)(lh + LUA_STACK_OFF) >= 0x100000000ULL &&
-            *(uintptr_t*)(lh + LUA_STACK_OFF) <= 0x16000000000ULL) {
+            *(uintptr_t*)(lh + LUA_STACK_OFF) <= 0x74000000000ULL) {
             mt = thread_L;
         }
         if (!mt) {
@@ -3917,7 +3935,7 @@ extern "C" int executor_decode_chunk(uintptr_t str_addr, char* buf, size_t len) 
                  first, executor_client_version());
         return -1;
     }
-    if (str_addr < 0x100000000ULL || str_addr > 0x16000000000ULL) {
+    if (str_addr < 0x100000000ULL || str_addr > 0x74000000000ULL) {
         snprintf(buf, len, "ERR: bad string addr\n");
         return -1;
     }
@@ -4024,14 +4042,14 @@ extern "C" int executor_find_main_sc(char* buf, size_t len) {
                     uintptr_t cand = sc + off;
                     if (level == 1) {
                         cand = *(uintptr_t*)(chunk + off);
-                        if (cand < 0x100000000ULL || cand > 0x16000000000ULL ||
+                        if (cand < 0x100000000ULL || cand > 0x74000000000ULL ||
                             (cand & 0xF) != 0)
                             continue;
                     }
                     if (lua_state_usable(cand)) {
                         uintptr_t G = 0, mt = 0;
                         safe_read(cand + 0x48, &G, 8);
-                        if (G < 0x100000000ULL || G > 0x16000000000ULL) continue;
+                        if (G < 0x100000000ULL || G > 0x74000000000ULL) continue;
                         safe_read(G + 0x90, &mt, 8);
                         if (!validate_main_thread(mt)) continue;
                         g_main_L = mt;
@@ -4069,7 +4087,7 @@ extern "C" int executor_findptr(uint64_t value, char* buf, size_t len) {
                                           (vm_region_info_t)&info, &cnt, &object_name);
         if (kr != KERN_SUCCESS) break;
         bool scannable = (info.protection & VM_PROT_READ) &&
-                         addr >= 0x100000000ULL && addr < 0x16000000000ULL &&
+                         addr >= 0x100000000ULL && addr < 0x74000000000ULL &&
                          size >= 8 && size < 0x80000000ULL;
         if (scannable) {
             uint8_t* chunk = (uint8_t*)malloc(1 << 20);
@@ -4152,9 +4170,9 @@ extern "C" int executor_exec_bc(const uint8_t* bc, size_t nbc, char* out, size_t
         uintptr_t Lg = 0;
         safe_read(L + 0x48, &Lg, 8);
         uintptr_t mt = 0;
-        if (Lg >= 0x100000000ULL && Lg <= 0x16000000000ULL)
+        if (Lg >= 0x100000000ULL && Lg <= 0x74000000000ULL)
             safe_read(Lg + 0x90, &mt, 8);
-        if (mt != L || glue < 0x100000000ULL || glue > 0x16000000000ULL) {
+        if (mt != L || glue < 0x100000000ULL || glue > 0x74000000000ULL) {
             LOG_CORE("EXECBC: SKIP L=%p glue=%#llx mt=%#llx", (void*)L,
                      (unsigned long long)glue, (unsigned long long)mt);
             continue;
@@ -4166,7 +4184,7 @@ extern "C" int executor_exec_bc(const uint8_t* bc, size_t nbc, char* out, size_t
         safe_read(L + 0x58, &tp, 8);
         if ((tp >> 56) == 0xca)
             tp = ((tp >> 32) & 0xffffff) << 32 | (tp & 0xffffffff);
-        if (tp < 0x100000000ULL || tp > 0x16000000000ULL) tp = top_abs;
+        if (tp < 0x100000000ULL || tp > 0x74000000000ULL) tp = top_abs;
 
         struct sigaction old_sa[2], old_alrm, sa;
         /* NOTE: no probe-bufload on main anymore — it leaked a closure onto
@@ -4245,7 +4263,7 @@ extern "C" int executor_exec_bc(const uint8_t* bc, size_t nbc, char* out, size_t
              * incremental GC collected closure/proto/k during our slow
              * scans, and resume then executed freed memory (op 0x66 -> br 0).
              * Restore happens after resume in the cleanup block below. */
-            if (jv3 != 0 || co < 0x100000000ULL || co > 0x16000000000ULL) {
+            if (jv3 != 0 || co < 0x100000000ULL || co > 0x74000000000ULL) {
                 /* failed to create thread: undo rooting changes now */
                 if (is_memory_writable(L + 0x58)) {
                     uintptr_t mtp = 0;
@@ -4274,7 +4292,7 @@ extern "C" int executor_exec_bc(const uint8_t* bc, size_t nbc, char* out, size_t
                          (unsigned long long)main_glue,
                          (unsigned long long)co_glue);
                 if (!co_glue && main_glue >= 0x100000000ULL &&
-                    main_glue <= 0x16000000000ULL && is_memory_writable(co + 0x78))
+                    main_glue <= 0x74000000000ULL && is_memory_writable(co + 0x78))
                     *(uintptr_t*)(co + 0x78) = main_glue;
             }
 
@@ -4295,7 +4313,7 @@ extern "C" int executor_exec_bc(const uint8_t* bc, size_t nbc, char* out, size_t
                 for (int bi = 0; bi < nbases && !found; bi++) {
                     uintptr_t ms = 0;
                     if (!safe_read(bases[bi] + 0x38, &ms, 8)) continue;
-                    if (ms < 0x100000000ULL || ms > 0x16000000000ULL) continue;
+                    if (ms < 0x100000000ULL || ms > 0x74000000000ULL) continue;
                     int readok = 0, fns = 0;
                     for (int off = -0x1000; off < 0x2000 && !found; off += 16) {
                         uintptr_t slot = ms + off;
@@ -4305,13 +4323,13 @@ extern "C" int executor_exec_bc(const uint8_t* bc, size_t nbc, char* out, size_t
                         readok++;
                         if ((t & 0xff) != 8) continue;
                         fns++;
-                        if (v < 0x100000000ULL || v > 0x16000000000ULL) continue;
+                        if (v < 0x100000000ULL || v > 0x74000000000ULL) continue;
                         uint64_t cont = 0;
                         safe_read(v + 0x28, &cont, 8);
                         LOG_CORE("EXECBC: stackfn[%d+%#x] %llx tt=8 cont=%llx",
                                  bi, off, (unsigned long long)v,
                                  (unsigned long long)cont);
-                        if (cont >= 0x100000000ULL && cont <= 0x16000000000ULL) {
+                        if (cont >= 0x100000000ULL && cont <= 0x74000000000ULL) {
                             g_harvested_cont = cont;
                             found = 1;
                             LOG_CORE("EXECBC: harvested trampoline %#llx from thread %d",
@@ -4360,7 +4378,7 @@ extern "C" int executor_exec_bc(const uint8_t* bc, size_t nbc, char* out, size_t
                 }
                 uintptr_t co_gt = 0;
                 safe_read(co + 0x70, &co_gt, 8);
-                if (envT < 0x100000000ULL || envT > 0x16000000000ULL)
+                if (envT < 0x100000000ULL || envT > 0x74000000000ULL)
                     envT = co_gt; /* fallback: inherited gt */
                 LOG_CORE("EXECBC: envT=%#llx (gt fallback=%#llx)",
                          (unsigned long long)envT, (unsigned long long)co_gt);
@@ -4563,7 +4581,7 @@ extern "C" int executor_exec_bc(const uint8_t* bc, size_t nbc, char* out, size_t
                                      (unsigned long long)ndesc,
                                      (unsigned long long)stored,
                                      (unsigned long long)stub);
-                            if (stub >= 0x100000000ULL && stub <= 0x16000000000ULL &&
+                            if (stub >= 0x100000000ULL && stub <= 0x74000000000ULL &&
                                 is_memory_writable(our_desc + 0x28)) {
                                 *(uintptr_t*)(our_desc + 0x28) = stub + (our_desc + 0x28);
                                 LOG_CORE("STUB: TRANSPLANTED -> stored=%#llx",
@@ -4735,7 +4753,7 @@ extern "C" int executor_exec_bc(const uint8_t* bc, size_t nbc, char* out, size_t
             }
             LOG_CORE("EXECBC: co-top err val=%#llx tag=%#llx",
                      (unsigned long long)ev, (unsigned long long)(et >> 32));
-            if ((et >> 32) == 6 && ev >= 0x100000000ULL && ev < 0x16000000000ULL) {
+            if ((et >> 32) == 6 && ev >= 0x100000000ULL && ev < 0x74000000000ULL) {
                 uint32_t slen = 0;
                 char sbuf[1025];
                 sbuf[0] = 0;
@@ -4763,7 +4781,7 @@ extern "C" int executor_exec_bc(const uint8_t* bc, size_t nbc, char* out, size_t
                 }
                 n += snprintf(out + n, out_len - n, "  [%d] tag=%#llx\n", i,
                               (unsigned long long)t);
-                if (t == 6 && v >= 0x100000000ULL && v < 0x16000000000ULL) {
+                if (t == 6 && v >= 0x100000000ULL && v < 0x74000000000ULL) {
                     uint32_t slen = 0;
                     char sbuf[1025];
                     sbuf[0] = 0;
