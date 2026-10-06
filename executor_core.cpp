@@ -3195,6 +3195,39 @@ static void log_thread_state(const char* tag, uintptr_t L) {
 }
 
 /* co = lua_newthread(mainL), plus popping the TValue it pushes on main. */
+/* Pick a parked (st=1) game-universe coroutine from the live candidates.
+ * Running our closure ON such a coroutine gives it the game's script
+ * context (identity, capabilities, ScriptContext) — the write/physics
+ * natives that segfault on a bare lua_newthread co work there. */
+static uintptr_t exec_pick_parked_game_co(void) {
+    if (!g_main_G || g_live_n <= 0) return 0;
+    /* prefer parked-in-yield (st=1) script coroutines; accept idle (st=0)
+     * game coroutines too — they carry the same script identity/context */
+    uintptr_t best0 = 0;
+    for (int i = 0; i < g_live_n; i++) {
+        uintptr_t P = g_live_L[i];
+        if (!P || P < 0x100000000ULL || P > 0x74000000000ULL) continue;
+        uint8_t st = 0xff;
+        if (!safe_read(P + LUA_STATUS_OFF, &st, 1)) continue;
+        if (st != 1 && st != 0) continue;
+        uintptr_t G = 0;
+        if (!safe_read(P + LUA_G_OFF, &G, 8) || G != g_main_G) continue;
+        if (!validate_usable_thread(P)) continue;
+        if (st == 1) return P;
+        if (!best0) {
+            /* st=0 heuristic: a real script coroutine has the Roblox
+             * ExtraSpace before the lua_State — [P-0x18] = the shared
+             * block pointer (a valid heap pointer). Internal coroutines
+             * (HTTP/telemetry) have garbage there. */
+            uintptr_t es = 0;
+            if (safe_read(P - 0x18, &es, 8) && es >= 0x100000000ULL &&
+                es <= 0x74000000000ULL && (es & 0xF) == 0)
+                best0 = P;
+        }
+    }
+    return best0;
+}
+
 static uintptr_t exec_newthread(uintptr_t mainL) {
     uintptr_t fn_newthread = exec_fn_addr(EXEC_FN_NEWTHREAD);
     if (!fn_newthread) {
@@ -3397,10 +3430,57 @@ extern "C" int executor_exec_gamestate(const char* code, char* out, size_t out_l
     }
     n += snprintf(out + n, out_len - n, "main L=%p\n", (void*)L);
 
-    uintptr_t co = exec_newthread(L);
+    /* HIJACK first: run on a parked GAME coroutine so our code inherits
+     * the real script context (write/physics natives need it). Fallback
+     * to the fresh lua_newthread co when no parked game co is available. */
+    uintptr_t hijacked_co = 0;
+    uint8_t saved_st = 0;
+    uintptr_t saved_ci = 0;
+    uintptr_t saved_gt = 0;
+    uintptr_t co = exec_pick_parked_game_co();
+    if (co) {
+        uintptr_t base_ci = 0;
+        if (safe_read(co + 0x58, &base_ci, 8) && base_ci &&
+            is_memory_writable(co + 0x50) && is_memory_writable(co + LUA_STATUS_OFF)) {
+            safe_read(co + LUA_STATUS_OFF, &saved_st, 1);
+            safe_read(co + 0x50, &saved_ci, 8);
+            /* forge the runner's START shape: status 0 + ci==base_ci.
+             * [co+0x58] (the ci allocation tail) stays REAL so luaD_call
+             * allocates our frame's ci ABOVE the game's live frames. */
+            *(uint8_t*)(co + LUA_STATUS_OFF) = 0;
+            *(uintptr_t*)(co + 0x50) = base_ci;
+            hijacked_co = co;
+            /* the script coroutine's globals table is the SANDBOXED env
+             * (game resolves to a security-wrapper FUNCTION there —
+             * "Instance expected, got function"). Point our hijacked co's
+             * gt at the main's RAW globals so imports resolve properly
+             * while the co keeps its own script identity for the write
+             * natives. [co+0x40] is the gt slot — safe to swap (not
+             * ci/base/top). */
+            uintptr_t main_gt = 0, co_gt = 0;
+            safe_read(L + 0x40, &main_gt, 8);
+            safe_read(co + 0x40, &co_gt, 8);
+            if (main_gt >= 0x100000000ULL && main_gt <= 0x74000000000ULL &&
+                is_memory_writable(co + 0x40)) {
+                *(uintptr_t*)(co + 0x40) = main_gt;
+                saved_gt = co_gt;
+                LOG_CORE("EXEC: HIJACK gt swap: co+0x40 %#llx -> %#llx (raw)",
+                         (unsigned long long)co_gt,
+                         (unsigned long long)main_gt);
+            }
+            LOG_CORE("EXEC: HIJACK parked game co=%p (saved st=%u ci=%#llx)",
+                     (void*)co, (unsigned)saved_st,
+                     (unsigned long long)saved_ci);
+        } else {
+            co = 0;
+        }
+    }
     if (!co) {
-        n += snprintf(out + n, out_len - n, "ERR: lua_newthread failed\n");
-        return -1;
+        co = exec_newthread(L);
+        if (!co) {
+            n += snprintf(out + n, out_len - n, "ERR: lua_newthread failed\n");
+            return -1;
+        }
     }
     log_thread_state("CO-FRESH", co);
 
@@ -3729,7 +3809,10 @@ extern "C" int executor_exec_gamestate(const char* code, char* out, size_t out_l
      * the calling thread's identity in the ExtraSpace before L. Our fresh
      * co has a zero identity -> "The current thread cannot connect".
      * Copy the ExtraSpace words from the game's main thread (the identity
-     * lives in the 0x18 bytes BEFORE the lua_State object). */
+     * lives in the 0x18 bytes BEFORE the lua_State object).
+     * SKIP for the hijacked game coroutine — it already carries the real
+     * script identity; overwriting it would corrupt game state. */
+    if (!hijacked_co) {
     {
         uintptr_t before_co[8] = {0};
         uintptr_t before_main[8] = {0};
@@ -3748,6 +3831,7 @@ extern "C" int executor_exec_gamestate(const char* code, char* out, size_t out_l
             *(uintptr_t*)(co - 0x10) = before_main[1];
             *(uintptr_t*)(co - 0x08) = before_main[2];
             LOG_CORE("EXEC: extraspace copied from main");
+        }
     }
 
     /* NOTE: do NOT copy lua_State fields +0x50..0x88 from main here —
@@ -3781,6 +3865,21 @@ extern "C" int executor_exec_gamestate(const char* code, char* out, size_t out_l
      * status==0 when [co+0x50]==[co+0x58] (ci==base_ci, true for a fresh
      * lua_newthread co) and from=NULL is handled (nCcalls=1). */
     int r = exec_run(co, 0);
+    /* restore the hijacked coroutine's real scheduler state BEFORE
+     * anything else touches it — the game's own script frames and the
+     * parked status must survive our run */
+    if (hijacked_co) {
+        if (is_memory_writable(hijacked_co + 0x50) &&
+            is_memory_writable(hijacked_co + LUA_STATUS_OFF)) {
+            *(uintptr_t*)(hijacked_co + 0x50) = saved_ci;
+            *(uint8_t*)(hijacked_co + LUA_STATUS_OFF) = saved_st;
+            if (saved_gt && is_memory_writable(hijacked_co + 0x40))
+                *(uintptr_t*)(hijacked_co + 0x40) = saved_gt;
+            LOG_CORE("EXEC: HIJACK restored (st=%u ci=%#llx gt=%#llx)",
+                     (unsigned)saved_st, (unsigned long long)saved_ci,
+                     (unsigned long long)saved_gt);
+        }
+    }
     LOG_CORE("EXEC: run(co=%p) -> %d", (void*)co, r);
     log_thread_state("CO-AFTER", co);
     /* dump the top stack slots raw — the error object hunting ground */
