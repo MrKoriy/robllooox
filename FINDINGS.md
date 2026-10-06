@@ -1111,3 +1111,105 @@ Vector3.new (fastcall, работал standalone). Не дошли из-за н�
    + диспетчеры гарантированно зарегистрированы его тредом).
 2. Либо: вытащить ИСТИННЫЕ wire-опкоды SETTABLEKS/namecall из реального
    чанка с записями (кэш модулей, 21721 шт) — сравнить наш 78/95 с их.
+
+# ФИНАЛ-7 (2026-10-07 02:00) — WRITE-БАРЬЕР СНЯТ (pcall-hook), ПОЛНАЯ WIRE-КАРТА, ДИАГНОСТИКА
+## Главное
+- **Запись свойств РАБОТАЕТ** через deferred-exec на игровом треде:
+  `game.Workspace.Gravity = 50` → rc=0 дважды (туда/обратно), клиент жив.
+  Барьер был контекстом вызова, а не регистрацией: на exec/hijack-пути —
+  SEGV, на треде живого игрового pcall — проходит.
+- **Wire-карта пополнена из дизасма хендлеров + живых семантических проб**:
+  MUL=9, MULK=91, POWK=4, ADD=67, ADDK=149 (проверено: 3*4→12 x's, n*7→21,
+  2+3→5). Источник истины wire→internal: таблица лоадера @ file 0x5bed438
+  (уникальное совпадение по 10 якорям).
+- **Хук на luaB_pcall (0x1026dde64) — резолвер ошибочно звал его lua_pcall**
+  (C-API): тот возвращал 2, ничего не исполняя. Исполнение через
+  luaD_call(L, top-16, -1) @ 0x10270af04 — работает.
+- **Трамплин: pre-index stp/str вариант был сломан** (ret по мусорному lr,
+  доказано изолированным тестом 85/85/2-вызова). Fixed-frame (sub sp,#96 +
+  abs-offset) — рабочий. Литералы: slot@+0x68, cont@+0x70, check@+0x78.
+- **Stale-hook recovery**: реинжект копии больше не стакает патчи — чужой
+  патч распознаётся, оригинальные insn восстанавливаются из старого
+  трамплина (+0x34), .quad переписывается на новый. Проверено вживую.
+- **Full-frame restore на fault-пути** (ci/base_ci/base/top/gt) — до фикса
+  contained-SEGV убивал клиент следом.
+- **remove_segv_guard** раньше восстанавливал SEGV/BUS наоборот — фикс.
+
+## Остаточные дефекты (активные)
+1. **R8**: много-стейтментный чанк (флай-пульс) НЕ грузится: «bytecode
+   corrupted». Фрагменты по одному — грузятся. Подозрение: aux-разметка
+   ремаппера устарела vs getOpLength (NEWTABLE/SETLIST/FORGLOOP/LOADKX/
+   FASTCALL2*/JUMPXEQK*/udata-варианты имеют aux). Фикс: довыводить
+   AUX_OPS из /tmp/luau-src/CodeGen/src/IrUtils.cpp.
+2. **Отложенная смерть** (pid 52574): через 13с после чистого rc=0-fire —
+   luaB_pcall вызван с L=NULL (краш @0x1026dde88, диспетчер 0x1026e9848).
+   Гипотеза H2 (микро-расхождение ci-флагов после nested luaD_call на
+   прерванном pcall-входе). Различающая проверка: lldb-снятие ci-цепочки
+   треда сразу после fire.
+3. Извлечение строки-результата на hook-пути неточное (fslot-дамп
+   добавлен; строка видна в логе, в ответе — не всегда).
+
+## Диагностический пакет
+- `diagnostics/` — полный пакет по спецификации (environment/architecture/
+  build/tests/evidence/execution-path/repro-matrix/crash-analysis/
+  memory-abi-audit/threading-ipc/hypotheses/summary + repro/ + logs/ +
+  crash/*.ips). Клиент после сессии оставлен живым и чистым (__DISARM__).
+
+## Процедура флая (когда починен R8)
+1. fresh клиент → live_inject → join 1818 → sleep 75
+2. `tools/fly741.py`: находит игровой G пробой LocalPlayer.Name (rc=0),
+   пинит через __ARMG__, пульсит velocity=look*60 @ 11Hz. Ctrl-C = посадка.
+## Что добавлено (executor_core.cpp + payload.c, собрано, smoke/resolvetest PASS)
+- **Отложенное исполнение (deferred-exec)**: `__ARM__ <src|BC:hex>` компилит
+  (тот же проверенный compile-stage: fn_init 0x10000c75c + ccompile
+  0x10364fdb4, копия blob'а ИЗ cache-owned module-string в свой буфер 64К)
+  или принимает сырой BC:hex → патчит вход lua_pcall игры → ARMED.
+- **Трамплин pcall** переписан: literal-pool @+0x60/0x68/0x70, replay
+  orig_n stolen-инструкций, два режима патча:
+  - BL (4 байта, один атомарный стор — без гонок) когда трамплин в ±128MB;
+  - wide BR-последовательность 16 байт (`ldr x16,#8; br x16; .quad tramp`)
+    когда дальше (entry-инструкция пишется ПОСЛЕДНЕЙ).
+  Своя область hook_pad+0x2000 (не пересекается с vtable-лабой).
+  Проверено по бинарю: первые 4 инструкции lua_pcall (0x1026dde64 на
+  0.741) = stp x20,x19 / stp x29,x30 / add x29 / mov x20,x1 — НЕ
+  PC-relative, replay безопасен в обоих режимах.
+- **hook_check**: slot 999 → pcall_hook_entry(x0=L). Разarmed-путь = 2
+  атомарных load'а (горячий путь игры не тормозится).
+- **Фильтр вселенной**: fires только на тредах с G == g_arm_g_filter
+  (или g_main_G, если фильтр=0). `__ARMG__ <hexG>` — ручной пин.
+- **run_staged_on(L)** — INLINE на треде игры в момент её собственного
+  pcall: gt-swap [L+0x40]→raw-gt main'а (sandboxed-gt проблема
+  «game=функция»), save/restore top, luau_load(L,"INJARM",bc) →
+  НАСТОЯЩИЙ lua_pcall(L,0,-1,0) (re-entry глушится флагом
+  g_pcall_in_hook → трамплин = passthrough). SEGV/TIMEOUT гарды +
+  best-effort restore top/gt даже на fault-пути (volatile через setjmp).
+- **Mailbox результата**: `__POLL__` (state/fires/L/G/rc/result),
+  `__REARM__` (повторный выстрел того же staged blob'а — для флай-лупа
+  10-15 Гц), `__DISARM__` (idle + восстановление 16 байт входа pcall).
+- **ФИКС remove_segv_guard**: обработчики SEGV/BUS восстанавливались
+  КРЕСТ-НАКРЕСТ (old_sa[0]=SEGV ставился на BUS и наоборот) — после
+  каждого guarded-вызова краш-хендлеры игры оставались перепутаны.
+  Вероятный вклад в «IPC-тред виснет после SEGV».
+
+## Процедура добивания флая (след. сессия)
+1. `pkill RobloxPlayer; запустить; live_inject; open placeId=1818; sleep 70`
+2. `__SCANL__` + `__CANDS__` один раз; warmup `return game.Name` → «Ugc»
+   (G-preference автолок, watchdog/hunter выключены — так надёжнее).
+3. **Тест записи через хук** (минимальное окно):
+   `__ARM__ workspace.Gravity=50` → ждать игровой pcall (мс) →
+   `__POLL__`. rc=0 = БАРЬЕР СНЯТ (диспетчеры живы в контексте игры).
+   rc=-4 = гипотеза неверна → маршрут 2 (сверка wire-опкодов с кэшем).
+4. Если rc=0: `__POLL__` chain: `return game.Workspace.Gravity` → 50.
+5. Флай-импульс: `__ARM__ <BC: или src ApplyImpulse-цепи>` → луп
+   `__REARM__` + `__POLL__` из python на 10-15 Гц.
+6. `__DISARM__` перед выходом (восстановление входа pcall).
+
+## Риски/ограничения маршрута
+- wide-патч (16B) неатомарен: ~нс-окно гонки на входе pcall. BL-путь
+  (атомарный) — дефолт; wide только если dylib дальше 128MB от бинаря
+  (лог скажет `wide=1`).
+- Yield внутри staged-чанка = ошибка pcall (нет continuation) — импульсы
+  без wait(), как и раньше.
+- Guard-окно на треде игры короткое (load+pcall); siglongjmp из чужого
+  треда теоретически возможен при фатале игры в это же окно — принято
+  (тот же профиль, что у exec-пути).

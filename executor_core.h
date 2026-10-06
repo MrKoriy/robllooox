@@ -79,6 +79,19 @@ const char* executor_client_version(void);
  * live magic-wrapped server chunk and hex-dump the inner format. */
 int executor_decode_chunk(uintptr_t str_addr, char* buf, size_t len);
 
+/* Deferred execution via the game's own protected-call path (write-barrier
+ * route 1): stage source (compiled) or raw bytecode ("BC:<hex>"), patch the
+ * game lua_pcall entry, and run the staged chunk inline on the next
+ * game-universe thread that calls pcall — full script identity and live
+ * native dispatchers. __ARM__ stages+hooks+arms, __POLL__ reads the parked
+ * result, __REARM__ refires the staged chunk, __DISARM__ unpatches,
+ * __ARMG__ <hexG> pins the universe filter (0 = follow the cached main). */
+int executor_arm(const char* code, char* out, size_t out_len);
+int executor_arm_poll(char* out, size_t out_len);
+int executor_arm_rearm(char* out, size_t out_len);
+int executor_arm_disarm(char* out, size_t out_len);
+int executor_arm_set_gfilter(uintptr_t G, char* out, size_t out_len);
+
 #ifdef __cplusplus
 }
 #endif

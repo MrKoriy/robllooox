@@ -1,0 +1,7 @@
+R1-const	rc=0	res=''	expect: rc=0, без ошибки
+R2-arith	rc=0	res=''	expect: rc=0 (MUL проверен ранее: 42)
+R3-string	rc=0	res=''	expect: rc=0
+R4-closure	rc=0	res=''	expect: rc=0 (DUPCLOSURE 192)
+R5-propread	rc=0	res='Workspace'	expect: rc=0
+R6-method	rc=0	res='Workspace'	expect: rc=0 (namecall, без изменения состояния)
+R7-write	rc=0	res='Workspace'	expect: ИЗВЕСТНЫЙ СЛУЧАЙ: запись свойства

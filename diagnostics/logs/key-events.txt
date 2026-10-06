@@ -1,0 +1,30 @@
+2026-10-05 01:18:24 [pid 24470] [executor-core] EXEC: SIGSEGV at 0x0 pc=0x0 lr=0x10736588c
+2026-10-05 01:46:46 [pid 47337] [executor-core] EXEC: SIGSEGV at 0x0 pc=0x0 lr=0x102969e58
+2026-10-05 02:10:26 [pid 51049] [executor-core] EXEC: SIGSEGV at 0x0 pc=0x0 lr=0x1067d5e58
+2026-10-06 02:24:47 [pid 47486] [executor-core] EXEC: SIGSEGV at 0x17 pc=0x105e807b4 lr=0x105e80778
+2026-10-06 14:56:43 [pid 54009] [executor-core] EXEC: SIGSEGV at 0x17 pc=0x1019e87b4 lr=0x1019e8778
+2026-10-06 14:56:43 [pid 54009] [executor-core] EXEC: SIGSEGV at 0x17 pc=0x1019e87b4 lr=0x1019e8778
+2026-10-06 14:58:45 [pid 54009] [executor-core] EXEC: SIGSEGV at 0x0 pc=0x0 lr=0x102cc9e58
+2026-10-06 15:08:00 [pid 56245] [executor-core] EXEC: SIGSEGV at 0x0 pc=0x0 lr=0x1056bd88c
+2026-10-06 15:08:00 [pid 56245] [executor-core] EXEC: SIGSEGV at 0x0 pc=0x0 lr=0x1056dde58
+2026-10-06 15:12:45 [pid 56245] [executor-core] EXEC: SIGSEGV at 0x0 pc=0x0 lr=0x1056bd88c
+2026-10-06 16:35:53 [pid 73010] [executor-core] EXEC: SIGSEGV at 0x0 pc=0x0 lr=0x1070f588c
+2026-10-06 16:48:13 [pid 76922] [executor-core] EXEC: SIGSEGV at 0x0 pc=0x0 lr=0x1027d588c
+2026-10-06 17:24:13 [pid 88956] [executor-core] EXEC: SIGSEGV at 0x0 pc=0x0 lr=0x10474188c
+2026-10-06 17:30:44 [pid 88956] [executor-core] EXEC: SIGSEGV at 0x17 pc=0x1034807b4 lr=0x103480778
+2026-10-06 22:56:54 [pid 78285] [executor-core] HOOK_PCALL: fn=0x103379e64 first16=f44fbea9 fd7b01a9 fd430091 f40301aa
+2026-10-06 22:56:54 [pid 78285] [executor-core] HOOK_PCALL: fn page mprotect RW failed kr=2 (page=0x103379000)
+2026-10-06 22:58:36 [pid 78285] [executor-core] HOOK_PCALL: fn=0x103379e64 first16=f44fbea9 fd7b01a9 fd430091 f40301aa
+2026-10-06 22:58:36 [pid 78285] [executor-core] HOOK_PCALL: fn page RW refused (kr=2), trying VM_PROT_COPY
+2026-10-06 22:58:36 [pid 78285] [executor-core] HOOK_PCALL: fn=0x103379e64 tramp=0x15e9f5000 wide=1 orig_n=4
+2026-10-06 22:58:37 [pid 78285] [executor-core] EXEC: SIGBUS at 0x15e9ff000 pc=0x15e9ff000 lr=0x15e9ff000
+2026-10-06 22:58:37 [pid 78285] [executor-core] ARM: fired on L=0x1444ceb80 G=0x113655110 rc=-4
+2026-10-07 00:12:26 [pid 19353] [executor-core] HOOK_PCALL: fn=0x102cade64 first16=f44fbea9 fd7b01a9 fd430091 f40301aa
+2026-10-07 00:12:26 [pid 19353] [executor-core] HOOK_PCALL: fn page RW refused (kr=2), trying VM_PROT_COPY
+2026-10-07 00:12:26 [pid 19353] [executor-core] HOOK_PCALL: fn=0x102cade64 tramp=0x161ded000 wide=1 orig_n=4
+2026-10-07 00:12:26 [pid 19353] [executor-core] EXEC: SIGBUS at 0x161df7000 pc=0x161df7000 lr=0x161df7000
+2026-10-07 00:12:26 [pid 19353] [executor-core] ARM: fired on L=0x71193d45d0 G=0x110b89110 rc=-4
+2026-10-07 00:16:14 [pid 25410] [executor-core] HOOK_PCALL: fn=0x1056a9e64 first16=f44fbea9 fd7b01a9 fd430091 f40301aa
+2026-10-07 00:16:14 [pid 25410] [executor-core] HOOK_PCALL: fn page RW refused (kr=2), trying VM_PROT_COPY
+2026-10-07 00:16:14 [pid 25410] [executor-core] HOOK_PCALL: fn=0x1056a9e64 tramp=0x167915000 wide=1 orig_n=4
+2026-10-07 00:16:15 [pid 25410] [executor-core] EXEC: SIGBUS at 0x16791f000 pc=0x16791f000 lr=0x16791f000

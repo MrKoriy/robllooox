@@ -1,0 +1,56 @@
+=== git ===
+main
+d49d5ed4e3a2ad3ad9af9620c5efc90b89d9597c
+origin	https://github.com/MrKoriy/robllooox.git (fetch)
+origin	https://github.com/MrKoriy/robllooox.git (push)
+
+ M FINDINGS.md
+ M executor_core.cpp
+ M executor_core.h
+ M payload.c
+?? diagnostics/
+?? tools/fly741.py
+?? tools/run741.py
+?? tools/wiremap741.py
+=== macOS ===
+ProductName:		macOS
+ProductVersion:		27.2
+BuildVersion:		26B5091g
+arm64
+=== toolchain ===
+Apple clang version 21.0.0 (clang-2100.3.34.2)
+Target: arm64-apple-darwin27.2.0
+Python 3.14.7
+=== xcode ===
+Xcode 27.0
+Build version 27A266a
+=== roblox ===
+0.741.0.7411056
+7411056
+=== roblox mach-o ===
+/Applications/Roblox.app/Contents/MacOS/RobloxPlayer: Mach-O 64-bit executable arm64
+magic cffaedfe
+=== sha256 ===
+73d2356171bb2a5f007f990e7c6381534d5bb30c0b1f4f8d2df198f1d3ddf6d4  payload.dylib
+=== build cmd ===
+
+
+
+all: $(TARGET)
+
+payload_c.o: payload.c
+
+
+=== luau ===
+HEAD
+config
+description
+hooks
+index
+info
+logs
+objects
+packed-refs
+refs
+shallow
+421cc81 Hash TypeId, TypePackId, void* and Constraint* by address (#3007)

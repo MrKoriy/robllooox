@@ -1,0 +1,7 @@
+[+] PING ok: PONG pid=63986 lua=idle
+[+] Lua exec ok: 'hello\t4\n=> 42'
+[+] Compile error reported ok
+[+] Runtime error reported ok
+[+] Large payload (>64KB) ok
+[+] All smoke tests passed.
+smoke exit=0

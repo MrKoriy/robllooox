@@ -112,8 +112,13 @@ static void install_segv_guard(struct sigaction* sa, struct sigaction* old_sa) {
 }
 
 static void remove_segv_guard(struct sigaction* sa, struct sigaction* old_sa) {
-    sigaction(SIGSEGV, &old_sa[1], NULL);
-    sigaction(SIGBUS, &old_sa[0], NULL);
+    (void)sa;
+    /* install_segv_guard saved SIGSEGV into old_sa[0] and SIGBUS into
+     * old_sa[1] — restore each from its own slot (they were restored
+     * crosswise before, which corrupted the game's crash-handler pair
+     * after every guarded call) */
+    sigaction(SIGSEGV, &old_sa[0], NULL);
+    sigaction(SIGBUS, &old_sa[1], NULL);
 }
 
 static void install_alrm_guard(struct sigaction* sa, struct sigaction* old_sa) {
@@ -1080,6 +1085,13 @@ extern "C" int executor_execute(const char* code, char* response_buf, size_t res
 
 #define TRAMP_SIZE 0x68
 #define HOOKPAD_SIZE 0x4000
+/* Slot index the pcall trampoline reports with (outside the 512-slot
+ * vtable range so hook_check routes it to the deferred-exec path) */
+#define PCALL_HOOK_SLOT 999
+/* Dedicated region inside hook_pad for the pcall trampoline — kept
+ * independent of g_tramp_area so it never clobbers vtable-lab stubs */
+#define PCALL_TRAMP_OFF  0x2000
+#define PCALL_TRAMP_SIZE 0x80
 
 /* Executable scratch space inside our own __TEXT (arm64e forbids fresh
  * executable mmap without a JIT entitlement). Trampolines are written
@@ -1137,7 +1149,15 @@ static volatile int g_vhook_dirty;
 static volatile uintptr_t g_vhook_slot, g_vhook_addr;
 static volatile int g_vhook_which, g_vhook_strict;
 
+static void pcall_hook_entry(uintptr_t L);   /* defined with the arm machinery */
+
 extern "C" void hook_check(uintptr_t x0, uintptr_t x1, uintptr_t slot_idx) {
+    if (slot_idx == PCALL_HOOK_SLOT) {
+        /* entry patch on the game's lua_pcall: x0 = the calling thread L.
+         * Deferred-exec path — runs the staged chunk inline when armed. */
+        pcall_hook_entry(x0);
+        return;
+    }
     if (slot_idx < 512) {
         uint64_t n = ++g_tramp_calls[slot_idx];
         if (n == 1) {
@@ -2298,49 +2318,70 @@ scan_done:
     LOG_CORE("EXEC: scan aborted by deadline (live=%d)", g_live_n);
 }
 
-static uint32_t g_pcall_orig_insn;
-static int g_pcall_hooked;
+/* ------------------------------------------------------------------ */
+/* lua_pcall inline hook (write-barrier route 1)                       */
+/*                                                                     */
+/* Patches the entry of the game's lua_pcall so every protected call  */
+/* in the process flows through hook_check(PCALL_HOOK_SLOT). When the */
+/* deferred-exec machinery is armed, the staged chunk runs INLINE on  */
+/* the calling game thread — full script identity and the live native */
+/* dispatch environment of a real game call frame (the exact context  */
+/* the write/physics natives NULL-deref without).                     */
+/* ------------------------------------------------------------------ */
 
+static uint32_t  g_pcall_orig_insn[4];
+static int       g_pcall_orig_n;
+static uintptr_t g_pcall_fn;
+static int       g_pcall_hooked;
+static int       g_pcall_wide;      /* 0 = 4-byte BL patch, 1 = 16-byte BR patch */
+
+/* Trampoline: fixed 96-byte frame (sub sp / absolute-offset slots — the
+ * pre-index stp/str variant mis-restored x30 empirically), call
+ * check(x0, x1, PCALL_HOOK_SLOT), restore, replay the orig_n stolen entry
+ * insns, branch back into orig_fn + orig_n*4.
+ * Literal pool: +0x68 = slot, +0x70 = continuation, +0x78 = check.
+ * Fits PCALL_TRAMP_SIZE (0x80). Verified end-to-end offline
+ * (tools/tramp harness: hooked fn runs, check fires, return intact). */
 static uintptr_t build_pcall_trampoline(uint8_t* area, uintptr_t orig_fn,
-                                        uintptr_t check_addr) {
+                                        uintptr_t check_addr, int orig_n) {
     uint8_t* t = area;
-    uintptr_t taddr = (uintptr_t)t;
-    put_u32(t + 0x00, insn_stp_pre(0, 1, 31, -16));
-    put_u32(t + 0x04, insn_stp_pre(2, 3, 31, -16));
-    put_u32(t + 0x08, insn_stp_pre(4, 5, 31, -16));
-    put_u32(t + 0x0c, insn_stp_pre(6, 7, 31, -16));
-    put_u32(t + 0x10, insn_str_pre(30, 31, -16));
-    put_u32(t + 0x14, insn_ldr_literal(17, taddr + 0x14, taddr + 0x60));
-    put_u32(t + 0x18, insn_ldr_literal(2, taddr + 0x18, taddr + 0x50));
-    put_u32(t + 0x1c, insn_blr(17));
-    put_u32(t + 0x20, insn_ldp_post(30, 31, 31, 16));
-    put_u32(t + 0x24, insn_ldp_post(6, 7, 31, 16));
-    put_u32(t + 0x28, insn_ldp_post(4, 5, 31, 16));
-    put_u32(t + 0x2c, insn_ldp_post(2, 3, 31, 16));
-    put_u32(t + 0x30, insn_ldp_post(0, 1, 31, 16));
-    memcpy(t + 0x34, &g_pcall_orig_insn, 4);  /* original first insn */
-    put_u32(t + 0x38, insn_ldr_literal(16, taddr + 0x38, taddr + 0x58));
-    put_u32(t + 0x3c, insn_br(16));
-    put_u32(t + 0x40, insn_nop());
-    put_u32(t + 0x44, insn_nop());
-    put_u32(t + 0x48, insn_nop());
-    put_u32(t + 0x4c, insn_nop());
-    put_quad(t + 0x50, 999);              /* slot index (out of 512 range) */
-    put_quad(t + 0x58, orig_fn + 4);      /* continue after patched insn */
-    put_quad(t + 0x60, check_addr);
-    __builtin___clear_cache((char*)t, (char*)t + TRAMP_SIZE);
-    return taddr;
+    uintptr_t ta = (uintptr_t)t;
+    put_u32(t + 0x00, 0xD10183FFu);                    /* sub sp, sp, #96   */
+    put_u32(t + 0x04, 0xA90007E0u);                    /* stp x0,x1,[sp]    */
+    put_u32(t + 0x08, 0xA9010FE2u);                    /* stp x2,x3,[sp,#16]*/
+    put_u32(t + 0x0c, 0xA90217E4u);                    /* stp x4,x5,[sp,#32]*/
+    put_u32(t + 0x10, 0xA9031FE6u);                    /* stp x6,x7,[sp,#48]*/
+    put_u32(t + 0x14, 0xF90023FEu);                    /* str x30,[sp,#64]  */
+    put_u32(t + 0x18, insn_ldr_literal(17, ta + 0x18, ta + 0x78)); /* check */
+    put_u32(t + 0x1c, insn_ldr_literal(2,  ta + 0x1c, ta + 0x68)); /* slot  */
+    put_u32(t + 0x20, insn_blr(17));
+    put_u32(t + 0x24, 0xF94023FEu);                    /* ldr x30,[sp,#64]  */
+    put_u32(t + 0x28, 0xA9431FE6u);                    /* ldp x6,x7,[sp,#48]*/
+    put_u32(t + 0x2c, 0xA94217E4u);                    /* ldp x4,x5,[sp,#32]*/
+    put_u32(t + 0x30, 0xA9410FE2u);                    /* ldp x2,x3,[sp,#16]*/
+    put_u32(t + 0x34, 0xA94007E0u);                    /* ldp x0,x1,[sp]    */
+    put_u32(t + 0x38, 0x910183FFu);                    /* add sp, sp, #96   */
+    size_t cur = 0x3c;
+    memcpy(t + cur, g_pcall_orig_insn, (size_t)orig_n * 4);
+    cur += (size_t)orig_n * 4;
+    put_u32(t + cur, insn_ldr_literal(16, ta + cur, ta + 0x70));   /* cont */
+    cur += 4;
+    put_u32(t + cur, insn_br(16));
+    cur += 4;
+    while (cur < 0x68) { put_u32(t + cur, insn_nop()); cur += 4; }
+    put_quad(t + 0x68, PCALL_HOOK_SLOT);
+    put_quad(t + 0x70, orig_fn + (uintptr_t)orig_n * 4);
+    put_quad(t + 0x78, check_addr);
+    __builtin___clear_cache((char*)t, (char*)t + PCALL_TRAMP_SIZE);
+    return ta;
 }
 
 static int executor_hook_pcall(uintptr_t fn) {
     if (g_pcall_hooked) return 0;
-    if (g_tramp_area == 0) {
-        g_tramp_area = (uintptr_t)hook_pad + 0x2000;
-        g_tramp_area_size = HOOKPAD_SIZE - 0x2000;
-    }
-    uintptr_t page = g_tramp_area & ~0xFFFULL;
+    uintptr_t area = (uintptr_t)hook_pad + PCALL_TRAMP_OFF;
+    uintptr_t page = (uintptr_t)hook_pad & ~0xFFFULL;
     kern_return_t kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)page,
-                                       HOOKPAD_SIZE + 0xFFF, false,
+                                       HOOKPAD_SIZE, false,
                                        VM_PROT_READ | VM_PROT_WRITE);
     if (kr != KERN_SUCCESS) {
         LOG_CORE("HOOK_PCALL: hookpad mprotect RW failed kr=%d", kr);
@@ -2352,49 +2393,161 @@ static int executor_hook_pcall(uintptr_t fn) {
         LOG_CORE("HOOK_PCALL: cannot read fn %p", (void*)fn);
         return -1;
     }
-    uint32_t orig_insn = *(uint32_t*)probe;
     LOG_CORE("HOOK_PCALL: fn=%p first16=%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
              (void*)fn, probe[0], probe[1], probe[2], probe[3],
              probe[4], probe[5], probe[6], probe[7],
              probe[8], probe[9], probe[10], probe[11],
              probe[12], probe[13], probe[14], probe[15]);
-    if (orig_insn == 0) {
+    uint32_t w0 = *(uint32_t*)probe;
+    uint32_t w1 = *(uint32_t*)(probe + 4);
+
+    /* Stale-hook recovery: a previous payload copy leaves its patch behind
+     * (dlopen of a fresh path loads a new image, but the OLD patch stays in
+     * the game code). Stacking a second patch on top corrupts the replay.
+     * The old trampoline's replay area holds the TRUE original insns —
+     * recover them and re-point the existing patch at OUR trampoline. */
+    int stale_wide = (w0 == 0x58000050u && w1 == 0xD61F0200u);   /* ldr x16,#8; br x16 */
+    int stale_bl   = ((w0 & 0xFC000000u) == 0x94000000u);        /* BL */
+    if (stale_bl) {
+        /* a genuine BL first-insn is possible in principle — only trust it
+         * as a stale patch when the target lands OUTSIDE the game __TEXT
+         * (i.e. in a dylib hookpad region) */
+        int64_t off0 = (int64_t)(w0 & 0x3FFFFFF);
+        if (off0 & (1 << 25)) off0 -= (1 << 26);
+        uintptr_t t0 = fn + (off0 << 2);
+        if (g_text_base && t0 >= g_text_base && t0 < g_text_end) stale_bl = 0;
+    }
+    if (stale_wide || stale_bl) {
+        uintptr_t old_tramp = 0;
+        if (stale_wide) {
+            old_tramp = *(uint64_t*)(probe + 8);
+        } else {
+            int64_t off = (int64_t)(w0 & 0x3FFFFFF);
+            if (off & (1 << 25)) off -= (1 << 26);
+            old_tramp = fn + (off << 2);
+        }
+        if (old_tramp < 0x100000000ULL || old_tramp > 0x74000000000ULL ||
+            !safe_read(old_tramp + 0x34, g_pcall_orig_insn, 16) ||
+            g_pcall_orig_insn[0] == 0) {
+            LOG_CORE("HOOK_PCALL: stale patch present but old tramp %p unreadable",
+                     (void*)old_tramp);
+            return -1;
+        }
+        g_pcall_wide = 1;
+        g_pcall_orig_n = 4;
+        uintptr_t tramp = build_pcall_trampoline((uint8_t*)area, fn,
+                                                 (uintptr_t)&hook_check, 4);
+        /* re-point ONLY the patch's .quad at our trampoline; fn+0/4 stay */
+        uintptr_t fpage = fn & ~0xFFFULL;
+        kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)fpage, 0x4000,
+                             false, VM_PROT_READ | VM_PROT_WRITE);
+        if (kr != KERN_SUCCESS) {
+            kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)fpage,
+                                 0x4000, false,
+                                 VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+        }
+        if (kr != KERN_SUCCESS) {
+            LOG_CORE("HOOK_PCALL: stale re-point mprotect failed kr=%d", kr);
+            return -1;
+        }
+        volatile uint32_t* p = (volatile uint32_t*)fn;
+        p[2] = (uint32_t)(tramp & 0xFFFFFFFFu);
+        p[3] = (uint32_t)(tramp >> 32);
+        __builtin___clear_cache((char*)fn, (char*)fn + 16);
+        mach_vm_protect(mach_task_self(), (mach_vm_address_t)page,
+                        HOOKPAD_SIZE, false, VM_PROT_READ | VM_PROT_EXECUTE);
+        mach_vm_protect(mach_task_self(), (mach_vm_address_t)fpage, 0x4000,
+                        false, VM_PROT_READ | VM_PROT_EXECUTE);
+        g_pcall_fn = fn;
+        g_pcall_hooked = 1;
+        LOG_CORE("HOOK_PCALL: re-pointed stale patch @%p -> new tramp %p "
+                 "(recovered orig insns from %p)",
+                 (void*)fn, (void*)tramp, (void*)old_tramp);
+        return 0;
+    }
+
+    if (w0 == 0) {
         LOG_CORE("HOOK_PCALL: first insn is 0 — stale address?");
         return -1;
     }
-    g_pcall_orig_insn = orig_insn;
+    memcpy(g_pcall_orig_insn, probe, 16);
 
-    uint8_t* area = (uint8_t*)g_tramp_area;
-    uintptr_t tramp = build_pcall_trampoline(area, fn, (uintptr_t)&hook_check);
-
-    int64_t diff = (int64_t)tramp - (int64_t)fn;
-    if (diff < -0x8000000LL || diff > 0x7FFFFFFLL) {
-        LOG_CORE("HOOK_PCALL: BL range too far (%lld)", (long long)diff);
-        return -1;
-    }
-    uint32_t bl = 0x94000000u | (uint32_t)((diff >> 2) & 0x3FFFFFF);
+    /* BL patch (single atomic 4-byte store) when the trampoline is within
+     * ±128MB; otherwise a 16-byte absolute BR sequence (works across any
+     * image distance, at the cost of a nanosecond-scale torn-patch window
+     * during the 4 stores). */
+    uintptr_t tramp;
+    int64_t diff = (int64_t)area - (int64_t)fn;
+    g_pcall_wide = (diff < -0x8000000LL || diff > 0x7FFFFFFLL);
+    g_pcall_orig_n = g_pcall_wide ? 4 : 1;
+    tramp = build_pcall_trampoline((uint8_t*)area, fn, (uintptr_t)&hook_check,
+                                   g_pcall_orig_n);
 
     uintptr_t fpage = fn & ~0xFFFULL;
     kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)fpage, 0x4000, false,
                          VM_PROT_READ | VM_PROT_WRITE);
     if (kr != KERN_SUCCESS) {
+        /* arm64e refuses plain RW on code pages even for adhoc-resigned
+         * binaries — COW the page instead: a private writable copy at the
+         * same address (same pattern as the vtable lab) */
+        LOG_CORE("HOOK_PCALL: fn page RW refused (kr=%d), trying VM_PROT_COPY", kr);
+        kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)fpage, 0x4000, false,
+                             VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    }
+    if (kr != KERN_SUCCESS) {
         LOG_CORE("HOOK_PCALL: fn page mprotect RW failed kr=%d (page=%p)", kr, (void*)fpage);
         return -1;
     }
-    uint32_t old = 0;
-    if (!safe_read(fn, &old, 4)) return -1;
-    *(volatile uint32_t*)fn = bl;
-    __builtin___clear_cache((char*)fn, (char*)(fn + 4));
+    volatile uint32_t* p = (volatile uint32_t*)fn;
+    if (!g_pcall_wide) {
+        int64_t bd = (int64_t)tramp - (int64_t)fn;
+        p[0] = 0x94000000u | (uint32_t)((bd >> 2) & 0x3FFFFFF);
+    } else {
+        /* ldr x16, #8 ; br x16 ; .quad tramp — entry insn written LAST */
+        p[1] = insn_br(16);
+        p[2] = (uint32_t)(tramp & 0xFFFFFFFFu);
+        p[3] = (uint32_t)(tramp >> 32);
+        __builtin___clear_cache((char*)fn, (char*)fn + 16);
+        p[0] = insn_ldr_literal(16, fn, fn + 8);
+    }
+    __builtin___clear_cache((char*)fn, (char*)fn + 16);
 
     kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)page,
-                         HOOKPAD_SIZE + 0xFFF, false,
+                         HOOKPAD_SIZE, false,
                          VM_PROT_READ | VM_PROT_EXECUTE);
     if (kr != KERN_SUCCESS) return -1;
     kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)fpage, 0x4000, false,
                          VM_PROT_READ | VM_PROT_EXECUTE);
     if (kr != KERN_SUCCESS) return -1;
+    g_pcall_fn = fn;
     g_pcall_hooked = 1;
-    LOG_CORE("HOOK_PCALL: fn=%p tramp=%p orig_insn=%#x bl=%#x", (void*)fn, (void*)tramp, orig_insn, bl);
+    LOG_CORE("HOOK_PCALL: fn=%p tramp=%p wide=%d orig_n=%d",
+             (void*)fn, (void*)tramp, g_pcall_wide, g_pcall_orig_n);
+    return 0;
+}
+
+static int executor_unhook_pcall(void) {
+    if (!g_pcall_hooked || !g_pcall_fn) return -1;
+    uintptr_t fpage = g_pcall_fn & ~0xFFFULL;
+    kern_return_t kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)fpage,
+                                       0x4000, false,
+                                       VM_PROT_READ | VM_PROT_WRITE);
+    if (kr != KERN_SUCCESS) {
+        kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)fpage,
+                             0x4000, false,
+                             VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    }
+    if (kr != KERN_SUCCESS) {
+        LOG_CORE("UNHOOK_PCALL: fn page mprotect RW failed kr=%d", kr);
+        return -1;
+    }
+    /* the saved 16 original bytes cover both patch widths */
+    memcpy((void*)g_pcall_fn, g_pcall_orig_insn, 16);
+    __builtin___clear_cache((char*)g_pcall_fn, (char*)g_pcall_fn + 16);
+    mach_vm_protect(mach_task_self(), (mach_vm_address_t)fpage, 0x4000, false,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    g_pcall_hooked = 0;
+    LOG_CORE("UNHOOK_PCALL: restored 16 bytes @%p", (void*)g_pcall_fn);
     return 0;
 }
 
@@ -3418,6 +3571,438 @@ static const char* resume_status_name(int r) {
         case -10: return "unresolved symbol (run __RESOLVE__)";
         default: return "?";
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* Deferred execution: stage bytecode once, fire it inside the game's  */
+/* own lua_pcall so the chunk runs on a real game script thread with  */
+/* its live identity / ScriptContext / native dispatch tables — the   */
+/* context the write/physics natives need (NULL-dispatch barrier).    */
+/*                                                                     */
+/* Flow: __ARM__ <src|BC:hex> stages + hooks + arms. The next game-   */
+/* universe pcall runs the chunk inline and parks the result here;    */
+/* __POLL__ reads it, __REARM__ fires the same staged chunk again,    */
+/* __DISARM__ unpatches. __ARMG__ <hexG> pins the universe filter.    */
+/* ------------------------------------------------------------------ */
+
+enum { ARM_IDLE = 0, ARM_ARMED = 1, ARM_BUSY = 2, ARM_DONE = 3 };
+
+static volatile int       g_arm_state = ARM_IDLE;
+static volatile int       g_pcall_in_hook = 0;   /* re-entry guard: our own
+                                                  * nested pcall passes through */
+static volatile uintptr_t g_arm_g_filter = 0;    /* 0 = follow g_main_G */
+static uint8_t            g_arm_bc[65536];
+static size_t             g_arm_bc_len;
+static int                g_arm_has_bc;
+static char               g_arm_result[4096];
+static uintptr_t          g_arm_fired_L;
+static uintptr_t          g_arm_fired_G;
+static int                g_arm_fired_rc = -999;
+static volatile uint64_t  g_arm_fire_count;
+
+static void arm_set_result(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(g_arm_result, sizeof(g_arm_result), fmt, args);
+    va_end(args);
+}
+
+/* Raw-bytecode staging: "BC:<hex>" goes straight into the staging buffer,
+ * same wire format as the exec pipeline's BC: mode. */
+static int arm_stage_hex(const char* hex, char* err, size_t err_len) {
+    size_t hl = strlen(hex);
+    while (hl > 0 && (hex[hl-1] == '\n' || hex[hl-1] == '\r' ||
+                      hex[hl-1] == ' '  || hex[hl-1] == '\t')) hl--;
+    if (hl < 2 || (hl & 1)) {
+        snprintf(err, err_len, "bad hex length");
+        return -1;
+    }
+    size_t bl = hl / 2;
+    if (bl > sizeof(g_arm_bc)) {
+        snprintf(err, err_len, "blob over staging cap (%zu > %zu)",
+                 bl, sizeof(g_arm_bc));
+        return -1;
+    }
+    for (size_t i = 0; i < bl; i++) {
+        unsigned v = 0;
+        if (sscanf(hex + i * 2, "%2x", &v) != 1) {
+            snprintf(err, err_len, "bad hex at byte %zu", i);
+            return -1;
+        }
+        g_arm_bc[i] = (uint8_t)v;
+    }
+    g_arm_bc_len = bl;
+    g_arm_has_bc = 1;
+    return 0;
+}
+
+/* Source staging: the client's own compiler (the exec pipeline's verified
+ * compile stage) — result copied out of the cache-owned module string into
+ * the staging buffer so later compiles cannot mutate it under us. */
+static int arm_stage_compile(const char* code, char* err, size_t err_len) {
+    uintptr_t fn_rawload = exec_fn_addr(EXEC_FN_RAWLOAD);
+    uintptr_t fn_compile = exec_fn_addr(EXEC_FN_COMPILE);
+    if (!fn_rawload || !fn_compile) {
+        snprintf(err, err_len, "compile/rawload unresolved on client %s",
+                 executor_client_version());
+        return -1;
+    }
+    uintptr_t slide = executor_image_slide();
+    uintptr_t fn_init = 0x10000c75cULL + slide;
+    uintptr_t fn_ccompile = 0x10364fdb4ULL + slide;
+    uint32_t first = 0;
+    if (!safe_read(fn_init, &first, 4) || first != 0xa9bc5ff8u ||
+        !safe_read(fn_ccompile, &first, 4) || first != 0xd10103ffu) {
+        snprintf(err, err_len, "string/compile signatures drifted on %s",
+                 executor_client_version());
+        return -1;
+    }
+    uint8_t srcStr[24];
+    memset(srcStr, 0, sizeof(srcStr));
+    uint8_t cont[0x18];
+    memset(cont, 0, sizeof(cont));
+    size_t slen = strlen(code);
+
+    struct sigaction osa[2], oalrm, sa;
+    install_segv_guard(&sa, osa);
+    install_alrm_guard(&sa, &oalrm);
+    alarm(20);
+    g_exec_segv = 0;
+    g_exec_timeout = 0;
+    int rr = -9;
+    int jv = sigsetjmp(g_exec_jmp, 1);
+    if (jv == 0) {
+        try {
+            ((void (*)(void*, const char*, size_t))fn_init)(srcStr, code, slen);
+#if defined(__aarch64__)
+            __asm__ volatile(
+                "mov x8, %[dst]\n"
+                "mov x0, %[srcp]\n"
+                "blr %[f]\n"
+                :
+                : [dst] "r" ((uintptr_t)cont),
+                  [srcp] "r" ((uintptr_t)srcStr),
+                  [f] "r" (fn_ccompile)
+                : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8",
+                  "x9", "x10", "x11", "x12", "x13", "x14", "x18",
+                  "memory", "cc");
+            rr = 0;
+#else
+            rr = -7;
+#endif
+        } catch (...) {
+            rr = -5;
+        }
+    } else {
+        rr = (jv == 2) ? -2 : -4;
+    }
+    remove_alrm_guard(&oalrm);
+    remove_segv_guard(&sa, osa);
+    if ((srcStr[0x17] & 0x80) && *(void**)srcStr) free(*(void**)srcStr);
+    if (rr != 0) {
+        snprintf(err, err_len, "compile stage rc=%d", rr);
+        return -1;
+    }
+
+    uintptr_t module = *(uintptr_t*)cont & PTR_MASK;
+    if (module < 0x100000000ULL || module > 0x74000000000ULL) {
+        snprintf(err, err_len, "compile container has no module0");
+        return -1;
+    }
+    uint8_t mod[0x48];
+    if (!safe_read(module, mod, sizeof(mod))) {
+        snprintf(err, err_len, "module unreadable");
+        return -1;
+    }
+    const uint8_t* bcs = mod + 0x18;              /* module string @ +0x18 */
+    uintptr_t bc_data;
+    size_t bc_len;
+    if (bcs[0x17] & 0x80) {                       /* long form */
+        bc_data = *(uintptr_t*)(mod + 0x18);
+        bc_len = *(size_t*)(mod + 0x20);
+    } else {                                      /* short: inline */
+        bc_data = (uintptr_t)(mod + 0x18);
+        bc_len = bcs[0x17];
+    }
+    if (bc_data < 0x100000000ULL || bc_data > 0x74000000000ULL ||
+        bc_len == 0 || bc_len > sizeof(g_arm_bc)) {
+        snprintf(err, err_len, "bad compiled blob (data=%#llx len=%#zx)",
+                 (unsigned long long)bc_data, bc_len);
+        return -1;
+    }
+    if (!safe_read(bc_data, g_arm_bc, bc_len)) {
+        snprintf(err, err_len, "blob read failed");
+        return -1;
+    }
+    if (bc_len == slen && memcmp(g_arm_bc, code, slen) == 0) {
+        snprintf(err, err_len, "compiler is dead on this build (passthrough)");
+        g_arm_has_bc = 0;
+        return -1;
+    }
+    g_arm_bc_len = bc_len;
+    g_arm_has_bc = 1;
+    LOG_CORE("ARM: staged %zu bytes, head=%02x %02x %02x %02x",
+             bc_len, g_arm_bc[0], g_arm_bc[1], g_arm_bc[2], g_arm_bc[3]);
+    return 0;
+}
+
+/* Runs the staged chunk ON the fired game thread, inline at its own
+ * lua_pcall call site. The game thread's stack shape and gt are restored
+ * afterwards so the pending original pcall proceeds normally. */
+static void run_staged_on(uintptr_t L) {
+    uintptr_t fn_load  = exec_fn_addr(EXEC_FN_BUfload);
+    if (!fn_load) {
+        arm_set_result("ERR: luau_load unresolved on client %s",
+                       executor_client_version());
+        g_arm_fired_rc = -10;
+        return;
+    }
+    /* luaD_call (0.741: 0x10270af04) — runs the closure at top-1.
+     * NOTE: the resolver's "lua_pcall" is actually the luaB_pcall BUILTIN
+     * (Lua-level pcall semantics — wrong for a direct C-side run; returned
+     * 2 without executing). luaD_call is the raw runner — Lua errors would
+     * longjmp into the game's nearest protected frame (the very pcall we
+     * hooked), which is acceptable; hard faults stay under our guard. */
+    uintptr_t fn_dcall = 0x10270af04ULL + executor_image_slide();
+    uint32_t first = 0;
+    if (!safe_read(fn_dcall, &first, 4) || first == 0) {
+        arm_set_result("ERR: luaD_call unreadable");
+        g_arm_fired_rc = -10;
+        return;
+    }
+    struct sigaction old_sa[2], old_alrm, sa;
+    install_segv_guard(&sa, old_sa);
+    install_alrm_guard(&sa, &old_alrm);
+    alarm(10);
+    g_exec_segv = 0;
+    g_exec_timeout = 0;
+    int rc = -9;
+    /* volatile: written between setjmp and a possible longjmp.
+     * The FULL lua frame state must be restorable: a contained fault
+     * siglongjmps out of the VM mid-instruction, abandoning the nested
+     * CallInfo — leaving L->ci/base pointing at a dead frame would crash
+     * the game thread as soon as its own pcall resumes. */
+    volatile uintptr_t saved_top_v = 0;
+    volatile uintptr_t saved_gt_v = 0;
+    volatile uintptr_t saved_ci_v = 0;
+    volatile uintptr_t saved_baseci_v = 0;
+    volatile uintptr_t saved_base_v = 0;
+    int jv = sigsetjmp(g_exec_jmp, 1);
+    if (jv == 0) {
+        try {
+            g_pcall_in_hook = 1;
+            /* gt-swap to the raw globals of the cached main: a fired script
+             * thread may carry the sandboxed env where `game` resolves to a
+             * wrapper function ("Instance expected, got function"). The raw
+             * gt resolves the real DataModel; restored below. */
+            uintptr_t sgt = 0, mgt = 0;
+            if (g_main_L && is_memory_writable(L + 0x40)) {
+                safe_read(L + 0x40, &sgt, 8);
+                safe_read(g_main_L + 0x40, &mgt, 8);
+                if (mgt >= 0x100000000ULL && mgt <= 0x74000000000ULL &&
+                    sgt != mgt) {
+                    *(uintptr_t*)(L + 0x40) = mgt;
+                    saved_gt_v = sgt;
+                }
+            }
+            uintptr_t s5 = 0, s6 = 0, s7 = 0, s8 = 0;
+            safe_read(L + 0x50, &s5, 8);   /* ci */
+            safe_read(L + 0x58, &s6, 8);   /* base_ci */
+            safe_read(L + 0x60, &s7, 8);   /* base */
+            safe_read(L + LUA_TOP_OFF, &s8, 8);
+            saved_ci_v = s5; saved_baseci_v = s6; saved_base_v = s7;
+            saved_top_v = s8;
+            int lr = ((int (*)(uintptr_t, const char*, const void*, size_t, int))
+                      fn_load)(L, "INJARM", g_arm_bc, g_arm_bc_len, 0);
+            if (lr != 0) {
+                char eb[512];
+                int got = extract_top_string(L, eb, sizeof(eb));
+                arm_set_result("load ret=%d%s%s%s", lr,
+                               got ? " err=\"" : "", got ? eb : "",
+                               got ? "\"" : "");
+                rc = -20 - lr;
+            } else {
+                /* the closure sits at top-1 after luau_load */
+                uintptr_t tp = 0;
+                safe_read(L + LUA_TOP_OFF, &tp, 8);
+                uintptr_t func = tp - 0x10;
+                ((void (*)(uintptr_t, uintptr_t, int))fn_dcall)(L, func, -1);
+                rc = 0;
+                /* result placement probe: dump slots around func (the call
+                 * base) AND around top — on this client the result does not
+                 * reliably land at top-1 (empirical) */
+                for (int k = -2; k <= 4; k++) {
+                    uintptr_t slot = func + (uintptr_t)k * 0x10;
+                    if (slot < 0x100000000ULL) continue;
+                    uint64_t v = 0; uint32_t t = 0;
+                    safe_read(slot, &v, 8);
+                    safe_read(slot + 0xc, &t, 4);
+                    LOG_CORE("ARM: fslot[%+d]=%#llx tt=%u", k,
+                             (unsigned long long)v, t);
+                    if (t == 6 && v >= 0x100000000ULL) {
+                        uint32_t slen = 0;
+                        if (safe_read((uintptr_t)v + 0x14, &slen, 4) &&
+                            slen > 0 && slen < 200) {
+                            char sb[208];
+                            if (safe_read((uintptr_t)v + 0x18, sb, slen)) {
+                                sb[slen] = 0;
+                                LOG_CORE("ARM: fslot[%+d] STR=\"%s\"", k, sb);
+                            }
+                        }
+                    }
+                }
+                char rb[512];
+                int got = extract_top_string(L, rb, sizeof(rb));
+                if (got > 0)
+                    arm_set_result("dcall ok out=\"%s\"", rb);
+                else
+                    arm_set_result("dcall ok");
+            }
+            if (saved_top_v && is_memory_writable(L + LUA_TOP_OFF))
+                *(uintptr_t*)(L + LUA_TOP_OFF) = saved_top_v;
+            if (saved_gt_v && is_memory_writable(L + 0x40))
+                *(uintptr_t*)(L + 0x40) = saved_gt_v;
+            g_pcall_in_hook = 0;
+        } catch (...) {
+            g_pcall_in_hook = 0;
+            rc = -3;
+            arm_set_result("C++ exception during staged run");
+        }
+    } else {
+        /* fault path: restore the FULL frame state so the game's own
+         * pcall continues on a consistent thread (ci/base_ci/base/top) */
+        g_pcall_in_hook = 0;
+        if (saved_top_v && is_memory_writable(L + LUA_TOP_OFF))
+            *(uintptr_t*)(L + LUA_TOP_OFF) = saved_top_v;
+        if (saved_ci_v && is_memory_writable(L + 0x50))
+            *(uintptr_t*)(L + 0x50) = saved_ci_v;
+        if (saved_baseci_v && is_memory_writable(L + 0x58))
+            *(uintptr_t*)(L + 0x58) = saved_baseci_v;
+        if (saved_base_v && is_memory_writable(L + 0x60))
+            *(uintptr_t*)(L + 0x60) = saved_base_v;
+        if (saved_gt_v && is_memory_writable(L + 0x40))
+            *(uintptr_t*)(L + 0x40) = saved_gt_v;
+        rc = (jv == 2) ? -2 : -4;
+        arm_set_result("%s during staged run on L=%p (contained, frame restored)",
+                       jv == 2 ? "TIMEOUT" : "SEGV", (void*)L);
+    }
+    remove_alrm_guard(&old_alrm);
+    remove_segv_guard(&sa, old_sa);
+    g_arm_fired_rc = rc;
+    g_arm_fired_L = L;
+    uintptr_t gtmp = 0;
+    if (safe_read(L + LUA_G_OFF, &gtmp, 8)) g_arm_fired_G = gtmp;
+    g_arm_fire_count++;
+    LOG_CORE("ARM: fired on L=%p G=%#llx rc=%d", (void*)L,
+             (unsigned long long)g_arm_fired_G, rc);
+}
+
+/* Entry from the trampoline on every lua_pcall in the process. Hot path
+ * when disarmed: two atomic loads. When armed, the first game-universe
+ * thread to call pcall claims the staged chunk and runs it inline. */
+static void pcall_hook_entry(uintptr_t L) {
+    if (g_pcall_in_hook) return;
+    if (__atomic_load_n(&g_arm_state, __ATOMIC_ACQUIRE) != ARM_ARMED) return;
+    if (L < 0x100000000ULL || L > 0x74000000000ULL || (L & 0xF)) return;
+    uint8_t hdr[0x70];
+    if (!safe_read(L, hdr, sizeof(hdr))) return;
+    if (hdr[LUA_TT_OFF] != 0xA) return;                 /* collectable thread */
+    uintptr_t G = *(uintptr_t*)(hdr + LUA_G_OFF);
+    uintptr_t want = g_arm_g_filter ? g_arm_g_filter : (uintptr_t)g_main_G;
+    /* filter 1 = accept ANY universe (discovery mode: the fired G is
+     * reported by __POLL__, letting the operator pin the game G) */
+    if (want && want != 1 && G != want) return;
+    int expected = ARM_ARMED;
+    if (!__atomic_compare_exchange_n(&g_arm_state, &expected, ARM_BUSY,
+                                     0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return;
+    run_staged_on(L);
+    __atomic_store_n(&g_arm_state, ARM_DONE, __ATOMIC_RELEASE);
+}
+
+extern "C" int executor_arm(const char* code, char* out, size_t out_len) {
+    if (!code || !*code) {
+        snprintf(out, out_len, "ERR: empty source\n");
+        return -1;
+    }
+    char err[200] = {0};
+    g_arm_has_bc = 0;
+    int src;
+    if (strncmp(code, "BC:", 3) == 0) src = arm_stage_hex(code + 3, err, sizeof(err));
+    else                              src = arm_stage_compile(code, err, sizeof(err));
+    if (src != 0) {
+        snprintf(out, out_len, "ERR: stage failed: %s\n", err);
+        return -1;
+    }
+    uintptr_t fn = exec_fn_addr(EXEC_FN_PCALL);
+    if (!fn) {
+        snprintf(out, out_len,
+                 "ERR: lua_pcall unresolved on client %s (run __RESOLVE__)\n",
+                 executor_client_version());
+        return -1;
+    }
+    if (executor_hook_pcall(fn) != 0) {
+        snprintf(out, out_len, "ERR: hook install failed (see payload log)\n");
+        return -1;
+    }
+    g_arm_fired_rc = -999;
+    g_arm_result[0] = 0;
+    __atomic_store_n(&g_arm_state, ARM_ARMED, __ATOMIC_RELEASE);
+    return snprintf(out, out_len,
+                    "ARMED: %zu bytes staged, pcall hook @%p (wide=%d), "
+                    "G filter=%#llx%s\n"
+                    "fires inline on the next game-universe pcall — "
+                    "poll with __POLL__\n",
+                    g_arm_bc_len, (void*)fn, g_pcall_wide,
+                    (unsigned long long)(g_arm_g_filter ? g_arm_g_filter
+                                                        : (uintptr_t)g_main_G),
+                    g_arm_g_filter ? "" : " (g_main_G)");
+}
+
+extern "C" int executor_arm_poll(char* out, size_t out_len) {
+    int st = __atomic_load_n(&g_arm_state, __ATOMIC_ACQUIRE);
+    const char* sn = st == ARM_IDLE ? "IDLE"  : st == ARM_ARMED ? "ARMED" :
+                     st == ARM_BUSY ? "BUSY"  : "DONE";
+    int n = snprintf(out, out_len, "state=%s fires=%llu hooked=%d\n", sn,
+                     (unsigned long long)g_arm_fire_count, g_pcall_hooked);
+    if (st == ARM_DONE) {
+        n += snprintf(out + n, out_len - n, "L=%p G=%#llx rc=%d\n%s\n",
+                      (void*)g_arm_fired_L, (unsigned long long)g_arm_fired_G,
+                      g_arm_fired_rc, g_arm_result);
+    }
+    return n;
+}
+
+extern "C" int executor_arm_rearm(char* out, size_t out_len) {
+    if (!g_arm_has_bc) {
+        snprintf(out, out_len, "ERR: nothing staged (run __ARM__ first)\n");
+        return -1;
+    }
+    if (!g_pcall_hooked) {
+        uintptr_t fn = exec_fn_addr(EXEC_FN_PCALL);
+        if (!fn || executor_hook_pcall(fn) != 0) {
+            snprintf(out, out_len, "ERR: re-hook failed (see payload log)\n");
+            return -1;
+        }
+    }
+    g_arm_fired_rc = -999;
+    g_arm_result[0] = 0;
+    __atomic_store_n(&g_arm_state, ARM_ARMED, __ATOMIC_RELEASE);
+    return snprintf(out, out_len, "REARMED (%zu bytes staged)\n", g_arm_bc_len);
+}
+
+extern "C" int executor_arm_disarm(char* out, size_t out_len) {
+    __atomic_store_n(&g_arm_state, ARM_IDLE, __ATOMIC_RELEASE);
+    int uh = executor_unhook_pcall();
+    return snprintf(out, out_len, "DISARMED (unhook %s)\n",
+                    uh == 0 ? "ok" : "skipped/failed");
+}
+
+extern "C" int executor_arm_set_gfilter(uintptr_t G, char* out, size_t out_len) {
+    g_arm_g_filter = G;
+    return snprintf(out, out_len,
+                    "G filter = %#llx (0 = follow g_main_G=%p, 1 = any universe)\n",
+                    (unsigned long long)G, (void*)g_main_G);
 }
 
 extern "C" int executor_exec_gamestate(const char* code, char* out, size_t out_len) {

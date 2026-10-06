@@ -12,6 +12,11 @@
  *   __PING__  -> "PONG ..."          (health check, no Lua needed)
  *   __RESET__ -> recreate Lua state  ("OK: Lua state reset")
  *   __RESOLVE__ -> client version + anchor-based symbol resolution report
+ *   __ARM__ <src|BC:hex> -> stage + hook game pcall + arm deferred exec
+ *   __POLL__  -> armed/done state + result of the last fired staged chunk
+ *   __REARM__ -> fire the staged chunk again on the next game pcall
+ *   __DISARM__ -> idle + restore the original lua_pcall entry
+ *   __ARMG__ <hexG|0> -> pin the universe filter (0 = follow cached main)
  */
 
 #include <stdio.h>
@@ -561,6 +566,38 @@ static char *handle_control_command(const char *msg) {
         snprintf(rbuf, sizeof(rbuf), "OK: [%#llx]=%#x (readback %#x)",
                  addr, (unsigned)val, *(volatile uint8_t*)addr);
         return strdup(rbuf);
+    }
+    if (n >= 7 && strncmp(msg, "__ARM__", 7) == 0) {
+        const char* code = msg + 7;
+        while (*code == ' ' || *code == '\t') code++;
+        char* out = malloc(8192);
+        if (!out) return strdup("ERR: oom");
+        executor_arm(code, out, 8192);
+        return out;
+    }
+    if (n == 8 && strncmp(msg, "__POLL__", 8) == 0) {
+        char* out = malloc(8192);
+        if (!out) return strdup("ERR: oom");
+        executor_arm_poll(out, 8192);
+        return out;
+    }
+    if (n == 9 && strncmp(msg, "__REARM__", 9) == 0) {
+        char buf[256];
+        executor_arm_rearm(buf, sizeof(buf));
+        return strdup(buf);
+    }
+    if (n == 10 && strncmp(msg, "__DISARM__", 10) == 0) {
+        char buf[256];
+        executor_arm_disarm(buf, sizeof(buf));
+        return strdup(buf);
+    }
+    if (n >= 8 && strncmp(msg, "__ARMG__", 8) == 0) {
+        unsigned long long G = 0;
+        if (sscanf(msg + 8, " %llx", &G) != 1)
+            return strdup("ERR: usage __ARMG__ <hexG|0>");
+        char buf[256];
+        executor_arm_set_gfilter((uintptr_t)G, buf, sizeof(buf));
+        return strdup(buf);
     }
     log_msg("unhandled control: '%s' (n=%zu)", msg, n);
     return NULL;

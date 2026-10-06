@@ -1,0 +1,145 @@
+rm -f payload.dylib *.o resolver_selftest
+=== BUILD ===
+cc -Wall -Wextra -O2 -fPIC -arch arm64 -arch x86_64 -c payload.c -o payload_c.o
+c++ -Wall -Wextra -O2 -fPIC -std=c++17 -arch arm64 -arch x86_64 -c executor_core.cpp -o executor_core.o
+executor_core.cpp:990:15: warning: unused variable 'tid' [-Wunused-variable]
+  990 |     pthread_t tid;
+      |               ^~~
+executor_core.cpp:1897:29: warning: variable 'c_g' set but not used [-Wunused-but-set-variable]
+ 1897 |         uint32_t c_tt9 = 0, c_g = 0;
+      |                             ^
+executor_core.cpp:1833:31: warning: comparison of integers of different signs: 'uint32_t' (aka 'unsigned int') and 'int' [-Wsign-compare]
+ 1833 |             if (g_coro_cnt[q] > bestn) { bestn = g_coro_cnt[q]; gbest = g_coro_G[q]; }
+      |                 ~~~~~~~~~~~~~ ^ ~~~~~
+executor_core.cpp:2075:80: warning: comparison of integers of different signs: 'uint32_t' (aka 'unsigned int') and 'int' [-Wsign-compare]
+ 2075 |                                 if (g_coro_cnt[seen < 0 ? g_coro_n - 1 : seen] > bestn &&
+      |                                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ^ ~~~~~
+executor_core.cpp:3006:13: warning: unused variable 'm' [-Wunused-variable]
+ 3006 |         int m = snprintf(out, out_len, "ERR: all %d candidates failed\n", g_live_n);
+      |             ^
+executor_core.cpp:2653:15: warning: unused variable 'fn_loadstr' [-Wunused-variable]
+ 2653 |     uintptr_t fn_loadstr = 0x1015412a8ULL + slide;
+      |               ^~~~~~~~~~
+executor_core.cpp:2691:5: warning: unused label 'next_cand' [-Wunused-label]
+ 2691 |     next_cand:
+      |     ^~~~~~~~~~
+executor_core.cpp:3465:45: warning: unused parameter 'from' [-Wunused-parameter]
+ 3465 | static int exec_run(uintptr_t co, uintptr_t from) {
+      |                                             ^
+executor_core.cpp:4856:19: warning: unused variable 'stack' [-Wunused-variable]
+ 4856 |         uintptr_t stack = g_live_stack[ci];
+      |                   ^~~~~
+executor_core.cpp:4820:15: warning: unused variable 'fn_pcall' [-Wunused-variable]
+ 4820 |     uintptr_t fn_pcall = exec_fn_addr(EXEC_FN_PCALL);
+      |               ^~~~~~~~
+executor_core.cpp:338:20: warning: unused function 'heap_ptr_ok' [-Wunused-function]
+  338 | static inline bool heap_ptr_ok(uint64_t p) {
+      |                    ^~~~~~~~~~~
+executor_core.cpp:800:14: warning: unused function 'hunter_thread' [-Wunused-function]
+  800 | static void* hunter_thread(void* arg) {
+      |              ^~~~~~~~~~~~~
+executor_core.cpp:4598:14: warning: unused function 'main_watchdog_thread' [-Wunused-function]
+ 4598 | static void* main_watchdog_thread(void* arg) {
+      |              ^~~~~~~~~~~~~~~~~~~~
+executor_core.cpp:1145:26: warning: unused variable 'g_tramp_total' [-Wunused-variable]
+ 1145 | static volatile uint64_t g_tramp_total;
+      |                          ^~~~~~~~~~~~~
+executor_core.cpp:2574:21: warning: unused variable 'g_intern_done' [-Wunused-variable]
+ 2574 | static volatile int g_intern_done = 0;
+      |                     ^~~~~~~~~~~~~
+executor_core.cpp:2575:27: warning: unused variable 'g_intern_ret' [-Wunused-variable]
+ 2575 | static volatile uintptr_t g_intern_ret = 0;
+      |                           ^~~~~~~~~~~~
+executor_core.cpp:2578:18: warning: unused function 'lua_pack_ptr' [-Wunused-function]
+ 2578 | static uintptr_t lua_pack_ptr(uintptr_t a) {
+      |                  ^~~~~~~~~~~~
+executor_core.cpp:3422:12: warning: unused function 'exec_resume' [-Wunused-function]
+ 3422 | static int exec_resume(uintptr_t co, uintptr_t fromL) {
+      |            ^~~~~~~~~~~
+executor_core.cpp:3503:12: warning: unused function 'exec_pcall' [-Wunused-function]
+ 3503 | static int exec_pcall(uintptr_t co) {
+      |            ^~~~~~~~~~
+executor_core.cpp:3559:20: warning: unused function 'resume_status_name' [-Wunused-function]
+ 3559 | static const char* resume_status_name(int r) {
+      |                    ^~~~~~~~~~~~~~~~~~
+executor_core.cpp:4174:21: warning: inline asm clobber list contains reserved registers: X18 [-Winline-asm]
+ 4174 |                     "mov x8, %[dst]\n"
+      |                     ^
+executor_core.cpp:4174:21: note: Reserved registers on the clobber list may not be preserved across the asm statement, and clobbering them may lead to undefined behaviour.
+executor_core.cpp:3679:17: warning: inline asm clobber list contains reserved registers: X18 [-Winline-asm]
+ 3679 |                 "mov x8, %[dst]\n"
+      |                 ^
+executor_core.cpp:3679:17: note: Reserved registers on the clobber list may not be preserved across the asm statement, and clobbering them may lead to undefined behaviour.
+executor_core.cpp:4657:21: warning: inline asm clobber list contains reserved registers: X18 [-Winline-asm]
+ 4657 |                     "mov x8, %[dst]\n"
+      |                     ^
+executor_core.cpp:4657:21: note: Reserved registers on the clobber list may not be preserved across the asm statement, and clobbering them may lead to undefined behaviour.
+23 warnings generated.
+executor_core.cpp:990:15: warning: unused variable 'tid' [-Wunused-variable]
+  990 |     pthread_t tid;
+      |               ^~~
+executor_core.cpp:1897:29: warning: variable 'c_g' set but not used [-Wunused-but-set-variable]
+ 1897 |         uint32_t c_tt9 = 0, c_g = 0;
+      |                             ^
+executor_core.cpp:1833:31: warning: comparison of integers of different signs: 'uint32_t' (aka 'unsigned int') and 'int' [-Wsign-compare]
+ 1833 |             if (g_coro_cnt[q] > bestn) { bestn = g_coro_cnt[q]; gbest = g_coro_G[q]; }
+      |                 ~~~~~~~~~~~~~ ^ ~~~~~
+executor_core.cpp:2075:80: warning: comparison of integers of different signs: 'uint32_t' (aka 'unsigned int') and 'int' [-Wsign-compare]
+ 2075 |                                 if (g_coro_cnt[seen < 0 ? g_coro_n - 1 : seen] > bestn &&
+      |                                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ^ ~~~~~
+executor_core.cpp:3006:13: warning: unused variable 'm' [-Wunused-variable]
+ 3006 |         int m = snprintf(out, out_len, "ERR: all %d candidates failed\n", g_live_n);
+      |             ^
+executor_core.cpp:2653:15: warning: unused variable 'fn_loadstr' [-Wunused-variable]
+ 2653 |     uintptr_t fn_loadstr = 0x1015412a8ULL + slide;
+      |               ^~~~~~~~~~
+executor_core.cpp:2691:5: warning: unused label 'next_cand' [-Wunused-label]
+ 2691 |     next_cand:
+      |     ^~~~~~~~~~
+executor_core.cpp:3465:45: warning: unused parameter 'from' [-Wunused-parameter]
+ 3465 | static int exec_run(uintptr_t co, uintptr_t from) {
+      |                                             ^
+executor_core.cpp:4856:19: warning: unused variable 'stack' [-Wunused-variable]
+ 4856 |         uintptr_t stack = g_live_stack[ci];
+      |                   ^~~~~
+executor_core.cpp:4820:15: warning: unused variable 'fn_pcall' [-Wunused-variable]
+ 4820 |     uintptr_t fn_pcall = exec_fn_addr(EXEC_FN_PCALL);
+      |               ^~~~~~~~
+executor_core.cpp:338:20: warning: unused function 'heap_ptr_ok' [-Wunused-function]
+  338 | static inline bool heap_ptr_ok(uint64_t p) {
+      |                    ^~~~~~~~~~~
+executor_core.cpp:800:14: warning: unused function 'hunter_thread' [-Wunused-function]
+  800 | static void* hunter_thread(void* arg) {
+      |              ^~~~~~~~~~~~~
+executor_core.cpp:4598:14: warning: unused function 'main_watchdog_thread' [-Wunused-function]
+ 4598 | static void* main_watchdog_thread(void* arg) {
+      |              ^~~~~~~~~~~~~~~~~~~~
+executor_core.cpp:1145:26: warning: unused variable 'g_tramp_total' [-Wunused-variable]
+ 1145 | static volatile uint64_t g_tramp_total;
+      |                          ^~~~~~~~~~~~~
+executor_core.cpp:2574:21: warning: unused variable 'g_intern_done' [-Wunused-variable]
+ 2574 | static volatile int g_intern_done = 0;
+      |                     ^~~~~~~~~~~~~
+executor_core.cpp:2575:27: warning: unused variable 'g_intern_ret' [-Wunused-variable]
+ 2575 | static volatile uintptr_t g_intern_ret = 0;
+      |                           ^~~~~~~~~~~~
+executor_core.cpp:2578:18: warning: unused function 'lua_pack_ptr' [-Wunused-function]
+ 2578 | static uintptr_t lua_pack_ptr(uintptr_t a) {
+      |                  ^~~~~~~~~~~~
+executor_core.cpp:3422:12: warning: unused function 'exec_resume' [-Wunused-function]
+ 3422 | static int exec_resume(uintptr_t co, uintptr_t fromL) {
+      |            ^~~~~~~~~~~
+executor_core.cpp:3503:12: warning: unused function 'exec_pcall' [-Wunused-function]
+ 3503 | static int exec_pcall(uintptr_t co) {
+      |            ^~~~~~~~~~
+executor_core.cpp:3559:20: warning: unused function 'resume_status_name' [-Wunused-function]
+ 3559 | static const char* resume_status_name(int r) {
+      |                    ^~~~~~~~~~~~~~~~~~
+20 warnings generated.
+c++ -arch arm64 -arch x86_64 -dynamiclib -undefined dynamic_lookup -lc++ -o payload.dylib payload_c.o executor_core.o
+ld: warning: ignoring duplicate libraries: '-lc++'
+ld: warning: ignoring duplicate libraries: '-lc++'
+codesign -s - --force payload.dylib
+payload.dylib: replacing existing signature
+[+] Build and codesign complete: payload.dylib
+build exit=0

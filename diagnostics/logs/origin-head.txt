@@ -1,0 +1,1 @@
+d49d5ed4e3a2ad3ad9af9620c5efc90b89d9597c 2026-10-06 17:36:26 +0300 hijack coroutine code complete (forge/restore/gt-swap + picker heuristics), sandboxed-gt universe identified, write-barrier precisely localized (NULL-dispatch at 0x1026f16a4), pcall-hook plan

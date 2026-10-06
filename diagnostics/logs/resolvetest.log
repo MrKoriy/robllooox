@@ -1,0 +1,54 @@
+c++ -std=c++17 -O2 -Wall -Wextra -o resolver_selftest tools/resolver_selftest.cpp
+./resolver_selftest
+== luau_resolver self-test ==
+file:   /Applications/Roblox.app/Contents/MacOS/RobloxPlayer
+size:   115130640 bytes
+cputype: 16777228
+uuid:   1807a3ea-4bd2-3b5c-9f4a-e002284a876a
+sections: 34 (code 4, data 30)  code range: 0x100001cc0 - 0x105126780
+
+-- symbols --
+lua_resume       OK   fn=0x1026e5a54  in=__TEXT,__text  method=anchor   occ=1 exact=2 page=289 fns=2 verified=1
+                      anchor="cannot resume %s coroutine" @ 0x1061ba1d3  xref @ 0x1026e5da8  [AMBIGUOUS]
+                      prefix: d10103ff a90157f6 a9024ff4 a9037bfd
+                      old 0.735 constant 0x102c48ab0 -> now 0x1026e5a54 (delta -5648476) DRIFTED
+                      NOTE: 2 functions reference this anchor; picked the one
+                      with the most references — verify by disassembly
+luaD_growstack   OK   fn=0x1026da99c  in=__TEXT,__text  method=anchor   occ=4 exact=40 page=164 fns=17 verified=0
+                      anchor="stack overflow" @ 0x1061b9a66  xref @ 0x1026daa78  [AMBIGUOUS]
+                      prefix: a9be4ff4 a9017bfd 910043fd aa0103f4
+                      old 0.732 constant 0x100219bb0 -> now 0x1026da99c (delta +38538732) DRIFTED
+luaG_runerror    OK   fn=0x1026e7184  in=__TEXT,__text  method=anchor   occ=1 exact=1 page=290 fns=1 verified=2
+                      anchor="attempt to index %s with '%s'" @ 0x1061ba3b0  xref @ 0x1026e7458
+                      prefix: d10103ff a9024ff4 a9037bfd 9100c3fd
+luaL_argerror    OK   fn=0x1026dc3ec  in=__TEXT,__text  method=anchor   occ=1 exact=1 page=203 fns=1 verified=1
+                      anchor="invalid argument #%d (%s expected, got %s)" @ 0x1061b9b4d  xref @ 0x1026dc4a8
+                      prefix: d100c3ff a9014ff4 a9027bfd 910083fd
+                      old 0.732 constant 0x10179d510 -> now 0x1026dc3ec (delta +15986396) DRIFTED
+luau_load        OK   fn=0x1026fddd0  in=__TEXT,__text  method=anchor   occ=1 exact=1 page=933 fns=1 verified=2
+                      anchor="%s: bytecode version mismatch (expected [%d..%d], got %d)" @ 0x1061bb769  xref @ 0x1026fe03c
+                      prefix: d102c3ff a90667fa a9075ff8 a90857f6
+                      old 0.735 constant 0x102c5b648 -> now 0x1026fddd0 (delta -5625976) DRIFTED
+lua_newthread    GAP  (no anchor text) — derive via lr_find_callers()
+lua_pcall        GAP  (no anchor text) — derive via lr_find_callers()
+rawload          GAP  (no anchor text) — derive via lr_find_callers()
+loadstring       OK   fn=0x101456cd0  in=__TEXT,__text  method=anchor   occ=1 exact=1 page=255 fns=1 verified=1
+                      anchor="loadstring() is not available" @ 0x1060e7756  xref @ 0x101456f5c
+                      prefix: d10683ff a9166ffc a91757f6 a9184ff4
+compile          GAP  (no anchor text) — derive via lr_find_callers()
+
+-- lr_find_callers(lua_resume @ 0x1026e5a54): 0 site(s) --
+
+-- derivation --
+lua_newthread     OK   fn=0x1026d6f1c  gates: iy_slots=1 create_pairs=1 bl+movz#6
+lua_resume split  OK     fn=0x1026e5a54  bl-to-stackalloc-callee=1
+lua_pcall         OK   fn=0x1026dde64  (xpcall fn=0x1026ddfe8, code-adjacent)
+rawload           OK   fn=0x1014485e0  (luau_load caller ∩ loadstring-wrapper callee)
+compile           OK   fn=0x10364fdb4  (loadstring BL right before rawload)
+
+-- verdict --
+anchored resolved: 6/6
+derived resolved:  4/4
+required symbols without an anchor (known work): 4 — lua_newthread, lua_pcall, rawload, compile
+result: PASS
+resolvetest exit=0
