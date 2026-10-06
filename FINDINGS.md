@@ -1051,3 +1051,32 @@ Vector3.new (fastcall, работал standalone). Не дошли из-за н�
 - Импульс: namecall на Instance + Vector3 fastcall — оба механизма по-отдельности
   проверены ✓; связка не дошла из-за нестабильности клиента при
   повторных сканах (watchdog-рескан — выключить в след. сессии!).
+
+# ФИНАЛ-4 (2026-10-06 15:20) — ВЕСЬ ПРОТОКОЛ РАЗЪЁМЕН
+## Автолок вселенной РАБОТАЕТ
+- Первый exec сам находит игровую вселенную (warmup: game.Name="Ugc") —
+  G-преференс без watchdog/hunter (оба ВЫКЛЮЧЕНЫ — их сигналы/пробы вешали
+  IPC-тред и валили клиента!).
+## НОВЫЕ ВЕРИФИКАЦИИ
+- **SETTABLEKS-wire = 78** (16→78, лоадер принял: internal 130 + atom-aux!)
+- **LOADN-wire 140 → internal 210**
+- Vector3.new(0,300,0) В ИГРЕ: pcall=0 ✓
+- root.Anchored чтение ✓, root.Parent.ClassName="Model" ✓
+## ПОСЛЕДНИЙ БАРЬЕР (единственный!): ЗАПИСИ/ФИЗИКА СЕГФЕЙЛЯТСЯ
+- `root:ApplyImpulse(...)`, `workspace.Gravity=50`, `root.Anchored=true` —
+  всё pcall=-4 (SEGV В НАТИВЕ, до arg-check: даже ApplyImpulse(nil) сегфолтится!)
+- ЧТЕНИЯ (GETTABLEKS) и НЕ-ФИЗИКА namecall'ы (FindFirstChild/GetService) — РАБОТАЮТ.
+- Character по-прежнему «lacking capability Players» (врапер+0x48-копия и
+  ExtraSpace-запись identity=7/caps=~0 НЕ помогли) — НО обход через
+  Workspace работает, capability НЕ блокирует флай-цепь.
+- Вывод: write/physics-нативы на входе дерут контекст треда (ScriptContext),
+  которого нет у нашей co → NULL-deref → SEGV. SEGV в нативе ПОСЛЕ ЭТОГО
+  вешает IPC-тред (restored только рестартом клиента).
+## ПЛАН ДОБИВАНИЯ (2 маршрута)
+1. **Фейковый врапер**: [co+0x48] → наш скретч { [+0x90] = игровой
+   ScriptContext (SC из __SCDUMP__, второй @0x1569...) } — нативы читают
+   [L+0x48]→[+0x90] → контекст появится. Реализация: ~10 строк в exec.
+2. **Yield-resume hijack**: подсунуть нашу closure в запаркованную
+   (st=1) игровую корутину + runner(co, L, 0) — продолжит ВЕЗДЕ с нашим
+   кодом (ci->savedpc перезапись).
+- Плюс: после ЛЮБОГО SEGV — рестарт клиента (IPC-тред мёртв).

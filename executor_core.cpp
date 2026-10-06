@@ -985,17 +985,16 @@ extern "C" bool executor_init(void) {
     pthread_t tid;
     init_text_range();
     LOG_CORE("Roblox __TEXT: %p - %p", (void*)g_text_base, (void*)g_text_end);
-    if (pthread_create(&tid, NULL, hunter_thread, NULL) == 0) {
-        pthread_detach(tid);
-    }
+    /* hunter thread disabled: its vtable-instance probing spins for minutes
+     * with the game heap and its alarm/signal interplay wedges the exec
+     * path; the G-preference main discovery replaces it entirely */
     pthread_t rid;
     if (pthread_create(&rid, NULL, hook_reporter_thread, NULL) == 0) {
         pthread_detach(rid);
     }
-    pthread_t wid;
-    if (pthread_create(&wid, NULL, main_watchdog_thread, NULL) == 0) {
-        pthread_detach(wid);
-    }
+    /* watchdog disabled entirely: with the game joined its full rescans
+     * wedge the single IPC thread and destabilize the client; the exec
+     * path handles a stale main itself (G-preference pick, no scan) */
     return true;
 }
 
@@ -1793,7 +1792,6 @@ static void find_live_thread(void) {
     int coro_stored = 0;
     uintptr_t gbest = 0;
     int bestn = 0;
-    int weak_stored = 0; /* weak-path (tt9 CAND+) budget: cap at 256 */
     /* scan wall-clock baseline shared by the pass and region-loop checks */
     static mach_timebase_info_data_t tb_s;
     static int tb_s_init = 0;
@@ -2252,10 +2250,6 @@ static void find_live_thread(void) {
                             uint8_t stt = chunk[i + LUA_STATUS_OFF];
                             if (stt > 6 && stt != 0x7f) continue;
                         }
-                        /* weak-path budget: reserve half the slots for the
-                         * fully-validated (final-path) candidates so the
-                         * garbage-G tt9 hits can't monopolize the list */
-                        if (weak_stored >= 256) continue;
                         if (g_live_n < MAX_LIVE_CANDS) {
                             int cand_pri = 0;
                             if (chunk[i] == 0xA) cand_pri += 4;   /* LUA_TTHREAD per newthread */
@@ -2272,7 +2266,6 @@ static void find_live_thread(void) {
                                      (void*)stk, (void*)top, cand_pri);
                             if (g_live_n < 24) g_tt9_cands[g_live_n] = L;
                             g_live_n++;
-                            weak_stored++;
                         }
                     }
                     done += got;
@@ -3911,18 +3904,26 @@ extern "C" int executor_set_main(uintptr_t thread_L, char* buf, size_t len) {
     return 0;
 }
 
-/* Background watchdog: revalidates the cached main thread and rescans when
- * it goes stale. A VM switch (menu -> game, teleport) produces a burst of
- * fresh coroutines that the signature scan catches — so the cache re-locks
- * onto the active game universe automatically within seconds of a join. */
+/* Background watchdog: DISABLED rescans — with the game joined, a full
+ * heap re-walk (150s) wedges the IPC thread and destabilizes the client
+ * (observed crashes after a handful of probes). The cached main is
+ * revalidated cheaply; if it goes stale the exec path handles it. */
 static void* main_watchdog_thread(void* arg) {
     (void)arg;
     for (;;) {
-        sleep(10);
+        sleep(30);
         if (g_main_L && validate_main_thread(g_main_L)) continue;
-        char why[128];
-        uintptr_t got = confirmed_main_thread(why, sizeof(why));
-        LOG_CORE("WATCHDOG: rescan -> %s (%s)", got ? "locked" : "none", why);
+        /* soft refresh only: try the G-preference pick, never a full scan */
+        if (g_main_G && g_live_n > 0) {
+            for (int i = 0; i < g_live_n; i++) {
+                uintptr_t G = 0;
+                safe_read(g_live_L[i] + LUA_G_OFF, &G, 8);
+                if (G != g_main_G) continue;
+                if (!validate_usable_thread(g_live_L[i])) continue;
+                g_main_L = g_live_L[i];
+                break;
+            }
+        }
     }
     return NULL;
 }
